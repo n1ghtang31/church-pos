@@ -3,9 +3,13 @@ from flask_cors import CORS
 from datetime import datetime
 import json
 import os
+import sqlite3
 
 app = Flask(__name__)
 CORS(app)
+
+# Database file path
+DB_FILE = 'church_pos.db'
 
 # In-memory storage for simplicity
 ITEMS = [
@@ -21,7 +25,30 @@ ITEMS = [
     {"id": 10, "name": "Charity Bracelet", "price": 4.00}
 ]
 
-TRANSACTIONS = []
+def init_db():
+    """Initialize the SQLite database"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Create transactions table if it doesn't exist
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            items TEXT NOT NULL,
+            tender TEXT NOT NULL,
+            total REAL NOT NULL
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def get_db_connection():
+    """Get a database connection"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 @app.route('/api/items', methods=['GET'])
 def get_items():
@@ -57,22 +84,52 @@ def create_transaction():
             total += found_item['price'] * quantity
     
     # Create transaction record
-    transaction = {
-        "id": len(TRANSACTIONS) + 1,
-        "timestamp": datetime.now().isoformat(),
-        "items": data['items'],
-        "tender": data['tender'],
-        "total": round(total, 2)
-    }
+    timestamp = datetime.now().isoformat()
+    items_json = json.dumps(data['items'])
+    tender = data['tender']
+    total = round(total, 2)
     
-    TRANSACTIONS.append(transaction)
+    # Save to database
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT INTO transactions (timestamp, items, tender, total) VALUES (?, ?, ?, ?)',
+        (timestamp, items_json, tender, total)
+    )
+    conn.commit()
+    transaction_id = cursor.lastrowid
+    conn.close()
+    
+    transaction = {
+        "id": transaction_id,
+        "timestamp": timestamp,
+        "items": data['items'],
+        "tender": tender,
+        "total": total
+    }
     
     return jsonify(transaction), 201
 
 @app.route('/api/transactions', methods=['GET'])
 def get_transactions():
     """Get all transactions"""
-    return jsonify(TRANSACTIONS)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM transactions ORDER BY id')
+    rows = cursor.fetchall()
+    conn.close()
+    
+    transactions = []
+    for row in rows:
+        transactions.append({
+            "id": row['id'],
+            "timestamp": row['timestamp'],
+            "items": json.loads(row['items']),
+            "tender": row['tender'],
+            "total": row['total']
+        })
+    
+    return jsonify(transactions)
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -83,10 +140,16 @@ def get_stats():
         "venmo": {"count": 0, "total": 0}
     }
     
-    for transaction in TRANSACTIONS:
-        tender = transaction['tender']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT tender, total FROM transactions')
+    rows = cursor.fetchall()
+    conn.close()
+    
+    for row in rows:
+        tender = row['tender']
         stats[tender]['count'] += 1
-        stats[tender]['total'] += transaction['total']
+        stats[tender]['total'] += row['total']
     
     # Calculate overall total
     overall_total = sum(stats[t]['total'] for t in stats)
@@ -101,4 +164,6 @@ def get_stats():
     })
 
 if __name__ == '__main__':
+    # Initialize database on startup
+    init_db()
     app.run(debug=True, port=5000)

@@ -8,7 +8,7 @@ A simple POS system for church charity drives with 10 items and 3 payment tender
 - 3 payment tender types: Cash, Check, and Venmo
 - No tax calculations (as specified)
 - Simple, bare-bones React frontend
-- Flask Python backend with in-memory storage
+- Flask Python backend with SQLite database for persistent transaction storage
 
 ## Setup and Running
 
@@ -75,6 +75,12 @@ Returns all completed transactions.
 
 ### GET /api/stats
 Returns statistics grouped by tender type.
+
+## Data Persistence
+
+Transaction data is stored in a SQLite database (`church_pos.db`) which is automatically created when the server starts. This ensures that all transaction history is preserved even when the server is restarted.
+
+**Note:** The database file is excluded from version control via `.gitignore`.
 
 ## Items List
 
