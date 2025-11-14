@@ -26,6 +26,8 @@ python app.py
 
 The backend will start on `http://localhost:5000`
 
+**Note:** This runs Flask in debug mode for development. For production use, disable debug mode and use a production WSGI server like Gunicorn.
+
 ### Frontend (React)
 
 1. Navigate to the frontend directory:
