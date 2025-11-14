@@ -12,16 +12,17 @@ CORS(app)
 DB_FILE = "church_pos.db"
 
 # In-memory storage for simplicity
+# Items now organized by departments with open ring pricing (no fixed price)
 ITEMS = [
-    {"id": 1, "name": "Pecans", "price": 5.00},
-    {"id": 2, "name": "Prayer Book", "price": 10.00},
-    {"id": 3, "name": "Rosary Beads", "price": 8.00},
-    {"id": 4, "name": "Cross Pendant", "price": 12.00},
-    {"id": 5, "name": "Holy Water Bottle", "price": 3.00},
-    {"id": 6, "name": "Devotional Cards", "price": 2.00},
-    {"id": 7, "name": "Scripture Journal", "price": 15.00},
-    {"id": 8, "name": "Blessed Oil", "price": 6.00},
-    {"id": 9, "name": "Religious Art Print", "price": 20.00},
+    {"id": 1, "name": "Pecans", "department": "Food"},
+    {"id": 2, "name": "Prayer Book", "department": "Books"},
+    {"id": 3, "name": "Rosary Beads", "department": "Religious Items"},
+    {"id": 4, "name": "Cross Pendant", "department": "Religious Items"},
+    {"id": 5, "name": "Holy Water Bottle", "department": "Religious Items"},
+    {"id": 6, "name": "Devotional Cards", "department": "Books"},
+    {"id": 7, "name": "Scripture Journal", "department": "Books"},
+    {"id": 8, "name": "Blessed Oil", "department": "Religious Items"},
+    {"id": 9, "name": "Religious Art Print", "department": "Art & Decor"},
 ]
 
 
@@ -82,11 +83,12 @@ def create_transaction():
     for item in data["items"]:
         item_id = item.get("id")
         quantity = item.get("quantity", 1)
+        price = item.get("price", 0)  # Get custom price from transaction
 
-        # Find item in ITEMS list
+        # Validate item exists in ITEMS list
         found_item = next((i for i in ITEMS if i["id"] == item_id), None)
         if found_item:
-            total += found_item["price"] * quantity
+            total += price * quantity
 
     # Create transaction record
     timestamp = datetime.now().isoformat()
