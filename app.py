@@ -1,9 +1,10 @@
-# app.py
-# This version supports either SQLite (default) or Postgres if DATABASE_URL is set.
 import os
 import logging
-from datetime import datetime
+import time
+import urllib.parse as up
+import socket
 
+from datetime import datetime
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
@@ -38,7 +39,28 @@ ITEMS = [
     {"id": 8, "name": "Crafts", "department": "Misc"},
 ]
 
-# Database helpers: choose backend depending on DATABASE_URL
+# Helper: parse DATABASE_URL into components
+def parse_db_url_to_params(url):
+    parsed = up.urlparse(url)
+    return {
+        "host": parsed.hostname,
+        "port": parsed.port or 5432,
+        "dbname": parsed.path.lstrip("/"),
+        "user": parsed.username,
+        "password": parsed.password,
+    }
+
+# Helper: resolve IPv4 address for a host when available
+def resolve_ipv4(host, port=5432):
+    try:
+        addrs = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        if addrs:
+            return addrs[0][4][0]
+    except Exception:
+        pass
+    return host
+
+# SQLite helpers
 def init_sqlite():
     try:
         os.makedirs(os.path.dirname(DB_FILE) or ".", exist_ok=True)
@@ -76,40 +98,69 @@ def get_sqlite_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_postgres():
+# Postgres helpers (prefer IPv4)
+def get_postgres_conn():
+    params = parse_db_url_to_params(DATABASE_URL)
+    host = resolve_ipv4(params["host"], params["port"]) if params["host"] else None
+    conn = psycopg2.connect(
+        dbname=params["dbname"],
+        user=params["user"],
+        password=params["password"],
+        host=host,
+        port=params["port"],
+        sslmode="require",
+        connect_timeout=5,
+    )
+    return conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+def init_postgres(retries=3, backoff=2):
     if psycopg2 is None:
         raise RuntimeError("psycopg2 not installed but DATABASE_URL is set")
-    # Use sslmode=require if not present in the URL (supabase typically requires ssl)
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id SERIAL PRIMARY KEY,
-            timestamp TIMESTAMP NOT NULL,
-            tender TEXT NOT NULL,
-            total REAL NOT NULL,
-            "user" TEXT NOT NULL
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS transaction_items (
-            id SERIAL PRIMARY KEY,
-            transaction_id INTEGER NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-            item_id INTEGER NOT NULL,
-            item_name TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            price REAL NOT NULL
-        );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("Initialized Postgres DB from %s", DATABASE_URL)
-
-def get_postgres_conn():
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    # return a dict-like cursor
-    return conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    params = parse_db_url_to_params(DATABASE_URL)
+    host = resolve_ipv4(params["host"], params["port"]) if params["host"] else None
+    attempt = 0
+    while True:
+        try:
+            conn = psycopg2.connect(
+                dbname=params["dbname"],
+                user=params["user"],
+                password=params["password"],
+                host=host,
+                port=params["port"],
+                sslmode="require",
+                connect_timeout=5,
+            )
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMP NOT NULL,
+                    tender TEXT NOT NULL,
+                    total REAL NOT NULL,
+                    "user" TEXT NOT NULL
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS transaction_items (
+                    id SERIAL PRIMARY KEY,
+                    transaction_id INTEGER NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+                    item_id INTEGER NOT NULL,
+                    item_name TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    price REAL NOT NULL
+                );
+            """)
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info("Initialized Postgres DB from %s (using host %s)", params["host"], host)
+            break
+        except Exception:
+            attempt += 1
+            logger.exception("Postgres init attempt %d failed (host: %s)", attempt, host)
+            if attempt >= retries:
+                raise
+            time.sleep(backoff * attempt)
 
 # choose backend at startup
 USING_POSTGRES = bool(DATABASE_URL)
@@ -122,7 +173,7 @@ try:
 except Exception:
     logger.exception("DB initialization failed")
 
-# API endpoints (use appropriate DB APIs depending on backend)
+# API endpoints
 @app.route("/api/items", methods=["GET"])
 def get_items():
     return jsonify(ITEMS)
@@ -155,7 +206,6 @@ def create_transaction():
                 (timestamp, tender, total, "default_user"),
             )
             transaction_id = cur.fetchone()["id"]
-            # Insert items
             for item in data["items"]:
                 cur.execute(
                     'INSERT INTO transaction_items (transaction_id, item_id, item_name, quantity, price) VALUES (%s, %s, %s, %s, %s);',
