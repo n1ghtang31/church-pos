@@ -2,10 +2,14 @@
 # Build frontend
 FROM node:18-alpine AS frontend-build
 WORKDIR /src/frontend
+
+# Copy package file(s) only (works with or without a lockfile)
 COPY frontend/package*.json ./
-# If you have a lockfile, copy it as well
-COPY frontend/yarn.lock ./
-RUN npm ci --legacy-peer-deps
+
+# Install Node deps even if no lockfile is present
+RUN npm install --legacy-peer-deps
+
+# Copy the rest of the frontend and build
 COPY frontend/ .
 RUN npm run build
 
@@ -19,12 +23,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy backend files
+# Copy backend requirements and install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# Add gunicorn to requirements.txt or install it here:
+# Ensure gunicorn is installed if not in requirements.txt
 RUN pip install --no-cache-dir gunicorn
 
+# Copy application code
 COPY . /app
 
 # Copy frontend build into Flask static folder so Flask can serve it
@@ -36,7 +41,6 @@ RUN mkdir -p /data
 ENV DB_FILE=/data/church_pos.db
 ENV FLASK_STATIC_DIR=/app/frontend_build
 
-# Expose port and run with gunicorn
 EXPOSE 5000
-# Use a simple worker count; adjust for your host
+
 CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app", "--workers", "2", "--threads", "4"]
