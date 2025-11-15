@@ -1,18 +1,19 @@
 import json
 import sqlite3
+import os
 from datetime import datetime
-
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-app = Flask(__name__)
+# Serve built frontend from frontend_build if present
+static_dir = os.environ.get("FLASK_STATIC_DIR", "frontend_build")
+app = Flask(__name__, static_folder=static_dir, static_url_path="/")
 CORS(app)
 
-# Database file path
-DB_FILE = "church_pos.db"
+# Database file path (default to data dir for a container)
+DB_FILE = os.environ.get("DB_FILE", "church_pos.db")
 
-# In-memory storage for simplicity
-# Items now organized by departments with open ring pricing (no fixed price)
+# In-memory items
 ITEMS = [
     {"id": 1, "name": "Nuts", "department": "Food"},
     {"id": 2, "name": "Rada", "department": "Misc"},
@@ -24,13 +25,9 @@ ITEMS = [
     {"id": 8, "name": "Crafts", "department": "Misc"},
 ]
 
-
 def init_db():
-    """Initialize the SQLite database"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-
-    # Create transactions table if it doesn't exist
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,7 +37,6 @@ def init_db():
             user TEXT NOT NULL
         )
     """)
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transaction_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,86 +48,53 @@ def init_db():
             FOREIGN KEY (transaction_id) REFERENCES transactions(id)
         )
     """)
-
     conn.commit()
     conn.close()
 
-
 def get_db_connection():
-    """Get a database connection"""
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
-
 @app.route("/api/items", methods=["GET"])
 def get_items():
-    """Get all available items"""
     return jsonify(ITEMS)
-
 
 @app.route("/api/transactions", methods=["POST"])
 def create_transaction():
-    """Create a new transaction"""
     data = request.get_json()
-
     if not data:
         return jsonify({"error": "No data provided"}), 400
-
-    # Validate required fields
     if "items" not in data or "tender" not in data:
         return jsonify({"error": "Missing required fields: items, tender"}), 400
-
-    # Validate tender type
     valid_tenders = ["cash", "check", "venmo"]
     if data["tender"] not in valid_tenders:
-        return jsonify(
-            {"error": f"Invalid tender. Must be one of: {', '.join(valid_tenders)}"}
-        ), 400
+        return jsonify({"error": f"Invalid tender. Must be one of: {', '.join(valid_tenders)}"}), 400
 
-    # Calculate total
     total = 0
     for item in data["items"]:
         item_id = item.get("id")
         quantity = item.get("quantity", 1)
-        price = item.get("price", 0)  # Get custom price from transaction
-
-        # Validate item exists in ITEMS list
+        price = item.get("price", 0)
         found_item = next((i for i in ITEMS if i["id"] == item_id), None)
         if found_item:
             total += price * quantity
 
-    # Create transaction record
     timestamp = datetime.now().isoformat()
     tender = data["tender"]
     total = round(total, 2)
 
-    # Save to database
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    # Insert main transaction record
-    cursor.execute(
-        "INSERT INTO transactions (timestamp, tender, total, user) VALUES (?, ?, ?, ?)",
-        (timestamp, tender, total, "default_user"),
-    )
+    cursor.execute("INSERT INTO transactions (timestamp, tender, total, user) VALUES (?, ?, ?, ?)",
+                   (timestamp, tender, total, "default_user"))
     transaction_id = cursor.lastrowid
 
-    # Insert each item into transaction_items table
     for item in data["items"]:
-        cursor.execute(
-            """INSERT INTO transaction_items
-               (transaction_id, item_id, item_name, quantity, price)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                transaction_id,
-                item.get("id"),
-                item.get("name"),
-                item.get("quantity", 1),
-                item.get("price", 0)
-            )
-        )
-
+        cursor.execute("""INSERT INTO transaction_items
+           (transaction_id, item_id, item_name, quantity, price)
+           VALUES (?, ?, ?, ?, ?)""",
+                       (transaction_id, item.get("id"), item.get("name"), item.get("quantity", 1), item.get("price", 0)))
     conn.commit()
     conn.close()
 
@@ -142,86 +105,57 @@ def create_transaction():
         "tender": tender,
         "total": total,
     }
-
     return jsonify(transaction), 201
-
 
 @app.route("/api/transactions", methods=["GET"])
 def get_transactions():
-    """Get all transactions"""
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    # Get all transactions
     cursor.execute("SELECT * FROM transactions ORDER BY id")
     rows = cursor.fetchall()
-
     transactions = []
     for row in rows:
-        # Get items for this transaction
-        cursor.execute(
-            """SELECT item_id, item_name, quantity, price
-               FROM transaction_items
-               WHERE transaction_id = ?""",
-            (row["id"],)
-        )
+        cursor.execute("""SELECT item_id, item_name, quantity, price
+                          FROM transaction_items WHERE transaction_id = ?""",
+                       (row["id"],))
         items = cursor.fetchall()
-
-        transactions.append(
-            {
-                "id": row["id"],
-                "timestamp": row["timestamp"],
-                "items": [
-                    {
-                        "id": item["item_id"],
-                        "name": item["item_name"],
-                        "quantity": item["quantity"],
-                        "price": item["price"]
-                    }
-                    for item in items
-                ],
-                "tender": row["tender"],
-                "total": row["total"],
-            }
-        )
-
+        transactions.append({
+            "id": row["id"],
+            "timestamp": row["timestamp"],
+            "items": [{"id": item["item_id"], "name": item["item_name"], "quantity": item["quantity"], "price": item["price"]} for item in items],
+            "tender": row["tender"],
+            "total": row["total"],
+        })
     conn.close()
     return jsonify(transactions)
 
-
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
-    """Get statistics by tender type"""
-    stats = {
-        "cash": {"count": 0, "total": 0},
-        "check": {"count": 0, "total": 0},
-        "venmo": {"count": 0, "total": 0},
-    }
-
+    stats = {"cash": {"count": 0, "total": 0}, "check": {"count": 0, "total": 0}, "venmo": {"count": 0, "total": 0}}
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT tender, total FROM transactions")
     rows = cursor.fetchall()
     conn.close()
-
     for row in rows:
         tender = row["tender"]
-        stats[tender]["count"] += 1
-        stats[tender]["total"] += row["total"]
-
-    # Calculate overall total
+        if tender in stats:
+            stats[tender]["count"] += 1
+            stats[tender]["total"] += row["total"]
     overall_total = sum(stats[t]["total"] for t in stats)
     overall_count = sum(stats[t]["count"] for t in stats)
+    return jsonify({"by_tender": stats, "overall": {"count": overall_count, "total": round(overall_total, 2)}})
 
-    return jsonify(
-        {
-            "by_tender": stats,
-            "overall": {"count": overall_count, "total": round(overall_total, 2)},
-        }
-    )
-
+# Serve frontend app (if built) for SPA routes
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    # If static file exists, let Flask serve it; otherwise serve index.html
+    if app.static_folder and (path == "" or not os.path.exists(os.path.join(app.static_folder, path))):
+        return send_from_directory(app.static_folder, "index.html")
+    return send_from_directory(app.static_folder, path)
 
 if __name__ == "__main__":
-    # Initialize database on startup
     init_db()
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
