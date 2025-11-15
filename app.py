@@ -14,15 +14,14 @@ DB_FILE = "church_pos.db"
 # In-memory storage for simplicity
 # Items now organized by departments with open ring pricing (no fixed price)
 ITEMS = [
-    {"id": 1, "name": "Pecans", "department": "Food"},
-    {"id": 2, "name": "Prayer Book", "department": "Books"},
-    {"id": 3, "name": "Rosary Beads", "department": "Religious Items"},
-    {"id": 4, "name": "Cross Pendant", "department": "Religious Items"},
-    {"id": 5, "name": "Holy Water Bottle", "department": "Religious Items"},
-    {"id": 6, "name": "Devotional Cards", "department": "Books"},
-    {"id": 7, "name": "Scripture Journal", "department": "Books"},
-    {"id": 8, "name": "Blessed Oil", "department": "Religious Items"},
-    {"id": 9, "name": "Religious Art Print", "department": "Art & Decor"},
+    {"id": 1, "name": "Nuts", "department": "Food"},
+    {"id": 2, "name": "Rada", "department": "Misc"},
+    {"id": 3, "name": "Baked Goods", "department": "Food"},
+    {"id": 4, "name": "Honey", "department": "Food"},
+    {"id": 5, "name": "Jam", "department": "Food"},
+    {"id": 6, "name": "Mom & Pop Shop", "department": "Misc"},
+    {"id": 7, "name": "Danny Duzits", "department": "Misc"},
+    {"id": 8, "name": "Crafts", "department": "Misc"},
 ]
 
 
@@ -36,9 +35,21 @@ def init_db():
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
-            items TEXT NOT NULL,
             tender TEXT NOT NULL,
-            total REAL NOT NULL
+            total REAL NOT NULL,
+            user TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transaction_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            item_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            price REAL NOT NULL,
+            FOREIGN KEY (transaction_id) REFERENCES transactions(id)
         )
     """)
 
