@@ -103,19 +103,36 @@ def create_transaction():
 
     # Create transaction record
     timestamp = datetime.now().isoformat()
-    items_json = json.dumps(data["items"])
     tender = data["tender"]
     total = round(total, 2)
 
     # Save to database
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # Insert main transaction record
     cursor.execute(
-        "INSERT INTO transactions (timestamp, items, tender, total) VALUES (?, ?, ?, ?)",
-        (timestamp, items_json, tender, total),
+        "INSERT INTO transactions (timestamp, tender, total, user) VALUES (?, ?, ?, ?)",
+        (timestamp, tender, total, "default_user"),
     )
-    conn.commit()
     transaction_id = cursor.lastrowid
+
+    # Insert each item into transaction_items table
+    for item in data["items"]:
+        cursor.execute(
+            """INSERT INTO transaction_items
+               (transaction_id, item_id, item_name, quantity, price)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                transaction_id,
+                item.get("id"),
+                item.get("name"),
+                item.get("quantity", 1),
+                item.get("price", 0)
+            )
+        )
+
+    conn.commit()
     conn.close()
 
     transaction = {
@@ -134,22 +151,41 @@ def get_transactions():
     """Get all transactions"""
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # Get all transactions
     cursor.execute("SELECT * FROM transactions ORDER BY id")
     rows = cursor.fetchall()
-    conn.close()
 
     transactions = []
     for row in rows:
+        # Get items for this transaction
+        cursor.execute(
+            """SELECT item_id, item_name, quantity, price
+               FROM transaction_items
+               WHERE transaction_id = ?""",
+            (row["id"],)
+        )
+        items = cursor.fetchall()
+
         transactions.append(
             {
                 "id": row["id"],
                 "timestamp": row["timestamp"],
-                "items": json.loads(row["items"]),
+                "items": [
+                    {
+                        "id": item["item_id"],
+                        "name": item["item_name"],
+                        "quantity": item["quantity"],
+                        "price": item["price"]
+                    }
+                    for item in items
+                ],
                 "tender": row["tender"],
                 "total": row["total"],
             }
         )
 
+    conn.close()
     return jsonify(transactions)
 
 

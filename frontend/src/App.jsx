@@ -141,7 +141,7 @@ function App() {
       <div className="pos-layout">
         <div className="items-section">
           <h2>Items</h2>
-          
+
           {/* Department Tabs */}
           <div className="department-tabs">
             {departments.map((dept) => (
@@ -160,7 +160,7 @@ function App() {
             {activeItems.map((item) => (
               <div key={item.id} className="item-card">
                 <h3>{item.name}</h3>
-                <p className="open-ring-label">Open Ring</p>
+                <br></br>
                 <button onClick={() => openNumberPad(item)}>Select</button>
               </div>
             ))}
@@ -183,13 +183,17 @@ function App() {
                   </div>
                   <div className="cart-item-controls">
                     <button
-                      onClick={() => updateQuantity(item.cartId, item.quantity - 1)}
+                      onClick={() =>
+                        updateQuantity(item.cartId, item.quantity - 1)
+                      }
                     >
                       -
                     </button>
                     <span className="quantity">{item.quantity}</span>
                     <button
-                      onClick={() => updateQuantity(item.cartId, item.quantity + 1)}
+                      onClick={() =>
+                        updateQuantity(item.cartId, item.quantity + 1)
+                      }
                     >
                       +
                     </button>
@@ -258,7 +262,7 @@ function App() {
         <div className="modal-overlay" onClick={closeNumberPad}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
             <h2>Enter Price for {selectedItem?.name}</h2>
-            
+
             <div className="price-display">
               <span className="dollar-sign">$</span>
               <span className="price-value">{priceInput || "0.00"}</span>
@@ -274,7 +278,9 @@ function App() {
               <button onClick={() => handleNumberClick("1")}>1</button>
               <button onClick={() => handleNumberClick("2")}>2</button>
               <button onClick={() => handleNumberClick("3")}>3</button>
-              <button onClick={handleClear} className="clear-btn">C</button>
+              <button onClick={handleClear} className="clear-btn">
+                C
+              </button>
               <button onClick={() => handleNumberClick("0")}>0</button>
               <button onClick={() => handleNumberClick(".")}>.</button>
             </div>
