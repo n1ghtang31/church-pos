@@ -220,6 +220,39 @@ def get_stats():
         logger.exception("Error computing stats")
         return jsonify({"error": "Internal server error while computing stats"}), 500
 
+@app.route("/api/item-sales", methods=["GET"])
+def get_item_sales():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 
+                item_id,
+                item_name,
+                SUM(quantity) as total_quantity,
+                SUM(quantity * price) as total_amount
+            FROM transaction_items
+            GROUP BY item_id, item_name
+            ORDER BY total_amount DESC
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+
+        item_sales = [
+            {
+                "id": row["item_id"],
+                "name": row["item_name"],
+                "total_quantity": row["total_quantity"],
+                "total_amount": round(row["total_amount"], 2),
+            }
+            for row in rows
+        ]
+
+        return jsonify(item_sales)
+    except Exception:
+        logger.exception("Error fetching item sales")
+        return jsonify({"error": "Internal server error while fetching item sales"}), 500
+
 # Serve frontend app (if built) for SPA routes
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")

@@ -318,6 +318,14 @@ function App() {
         >
           View Transactions
         </a>
+        <a
+          href="https://church-pos.onrender.com/api/item-sales"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="api-link-btn"
+        >
+          View Item Sales
+        </a>
       </div>
     </div>
   );
