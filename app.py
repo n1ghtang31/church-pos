@@ -1,24 +1,32 @@
-import json
-import sqlite3
+# app.py
+# This version supports either SQLite (default) or Postgres if DATABASE_URL is set.
 import os
 import logging
 from datetime import datetime
+
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-# Configure logging
+# try to import psycopg2; only used when DATABASE_URL is provided
+try:
+    import psycopg2
+    import psycopg2.extras
+except Exception:
+    psycopg2 = None
+
+import sqlite3
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("church-pos")
 
-# Serve built frontend from frontend_build if present
 static_dir = os.environ.get("FLASK_STATIC_DIR", "frontend_build")
 app = Flask(__name__, static_folder=static_dir, static_url_path="/")
 CORS(app)
 
-# Database file path (default to data dir for a container)
-DB_FILE = os.environ.get("DB_FILE", "church_pos.db")
+# Config
+DB_FILE = os.environ.get("DB_FILE", "/data/church_pos.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Supabase/Managed Postgres URL (if present)
 
-# In-memory items
 ITEMS = [
     {"id": 1, "name": "Nuts", "department": "Food"},
     {"id": 2, "name": "Rada", "department": "Misc"},
@@ -30,24 +38,22 @@ ITEMS = [
     {"id": 8, "name": "Crafts", "department": "Misc"},
 ]
 
-def init_db():
+# Database helpers: choose backend depending on DATABASE_URL
+def init_sqlite():
     try:
-        # Ensure directory for DB exists
-        db_dir = os.path.dirname(DB_FILE)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(DB_FILE) or ".", exist_ok=True)
         conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("""
+        cur = conn.cursor()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
                 tender TEXT NOT NULL,
                 total REAL NOT NULL,
-                user TEXT NOT NULL
+                "user" TEXT NOT NULL
             )
         """)
-        cursor.execute("""
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS transaction_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 transaction_id INTEGER NOT NULL,
@@ -62,25 +68,61 @@ def init_db():
         conn.close()
         logger.info("Initialized SQLite DB at %s", DB_FILE)
     except Exception:
-        logger.exception("Failed to initialize DB at %s", DB_FILE)
+        logger.exception("Failed to initialize SQLite DB")
         raise
 
-def get_db_connection():
-    try:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        conn.row_factory = sqlite3.Row
-        return conn
-    except Exception:
-        logger.exception("Failed to get DB connection for %s", DB_FILE)
-        raise
+def get_sqlite_conn():
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# Initialize DB at import time so it's ready under gunicorn
+def init_postgres():
+    if psycopg2 is None:
+        raise RuntimeError("psycopg2 not installed but DATABASE_URL is set")
+    # Use sslmode=require if not present in the URL (supabase typically requires ssl)
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id SERIAL PRIMARY KEY,
+            timestamp TIMESTAMP NOT NULL,
+            tender TEXT NOT NULL,
+            total REAL NOT NULL,
+            "user" TEXT NOT NULL
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transaction_items (
+            id SERIAL PRIMARY KEY,
+            transaction_id INTEGER NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+            item_id INTEGER NOT NULL,
+            item_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            price REAL NOT NULL
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    logger.info("Initialized Postgres DB from %s", DATABASE_URL)
+
+def get_postgres_conn():
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    # return a dict-like cursor
+    return conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+# choose backend at startup
+USING_POSTGRES = bool(DATABASE_URL)
+
 try:
-    init_db()
+    if USING_POSTGRES:
+        init_postgres()
+    else:
+        init_sqlite()
 except Exception:
-    # If DB init fails at import, let it bubble so the process fails fast and logs show the problem.
-    pass
+    logger.exception("DB initialization failed")
 
+# API endpoints (use appropriate DB APIs depending on backend)
 @app.route("/api/items", methods=["GET"])
 def get_items():
     return jsonify(ITEMS)
@@ -99,49 +141,48 @@ def create_transaction():
 
         total = 0
         for item in data["items"]:
-            item_id = item.get("id")
             quantity = item.get("quantity", 1)
             price = item.get("price", 0)
-            found_item = next((i for i in ITEMS if i["id"] == item_id), None)
-            if found_item:
-                total += price * quantity
-
+            total += price * quantity
         timestamp = datetime.now().isoformat()
         tender = data["tender"]
         total = round(total, 2)
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO transactions (timestamp, tender, total, user) VALUES (?, ?, ?, ?)",
-            (timestamp, tender, total, "default_user"),
-        )
-        transaction_id = cursor.lastrowid
-
-        for item in data["items"]:
-            cursor.execute(
-                """INSERT INTO transaction_items
-                   (transaction_id, item_id, item_name, quantity, price)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (
-                    transaction_id,
-                    item.get("id"),
-                    item.get("name"),
-                    item.get("quantity", 1),
-                    item.get("price", 0),
-                ),
+        if USING_POSTGRES:
+            conn, cur = get_postgres_conn()
+            cur.execute(
+                'INSERT INTO transactions (timestamp, tender, total, "user") VALUES (%s, %s, %s, %s) RETURNING id;',
+                (timestamp, tender, total, "default_user"),
             )
+            transaction_id = cur.fetchone()["id"]
+            # Insert items
+            for item in data["items"]:
+                cur.execute(
+                    'INSERT INTO transaction_items (transaction_id, item_id, item_name, quantity, price) VALUES (%s, %s, %s, %s, %s);',
+                    (transaction_id, item.get("id"), item.get("name"), item.get("quantity", 1), item.get("price", 0)),
+                )
+            conn.commit()
+            cur.close()
+            conn.close()
+        else:
+            conn = get_sqlite_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO transactions (timestamp, tender, total, user) VALUES (?, ?, ?, ?)",
+                (timestamp, tender, total, "default_user"),
+            )
+            transaction_id = cur.lastrowid
+            for item in data["items"]:
+                cur.execute(
+                    """INSERT INTO transaction_items
+                       (transaction_id, item_id, item_name, quantity, price)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (transaction_id, item.get("id"), item.get("name"), item.get("quantity", 1), item.get("price", 0)),
+                )
+            conn.commit()
+            conn.close()
 
-        conn.commit()
-        conn.close()
-
-        transaction = {
-            "id": transaction_id,
-            "timestamp": timestamp,
-            "items": data["items"],
-            "tender": tender,
-            "total": total,
-        }
+        transaction = {"id": transaction_id, "timestamp": timestamp, "items": data["items"], "tender": tender, "total": total}
         return jsonify(transaction), 201
 
     except Exception:
@@ -151,38 +192,48 @@ def create_transaction():
 @app.route("/api/transactions", methods=["GET"])
 def get_transactions():
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM transactions ORDER BY id")
-        rows = cursor.fetchall()
-        transactions = []
-        for row in rows:
-            cursor.execute(
-                """SELECT item_id, item_name, quantity, price
-                   FROM transaction_items
-                   WHERE transaction_id = ?""",
-                (row["id"],),
-            )
-            items = cursor.fetchall()
-            transactions.append(
-                {
-                    "id": row["id"],
-                    "timestamp": row["timestamp"],
-                    "items": [
-                        {
-                            "id": item["item_id"],
-                            "name": item["item_name"],
-                            "quantity": item["quantity"],
-                            "price": item["price"],
-                        }
-                        for item in items
-                    ],
-                    "tender": row["tender"],
-                    "total": row["total"],
-                }
-            )
-        conn.close()
-        return jsonify(transactions)
+        if USING_POSTGRES:
+            conn, cur = get_postgres_conn()
+            cur.execute("SELECT id, timestamp, tender, total FROM transactions ORDER BY id;")
+            rows = cur.fetchall()
+            transactions = []
+            for row in rows:
+                cur.execute("SELECT item_id, item_name, quantity, price FROM transaction_items WHERE transaction_id = %s;", (row["id"],))
+                items = cur.fetchall()
+                transactions.append(
+                    {
+                        "id": row["id"],
+                        "timestamp": row["timestamp"].isoformat() if hasattr(row["timestamp"], "isoformat") else row["timestamp"],
+                        "items": [{"id": it["item_id"], "name": it["item_name"], "quantity": it["quantity"], "price": it["price"]} for it in items],
+                        "tender": row["tender"],
+                        "total": float(row["total"]),
+                    }
+                )
+            cur.close()
+            conn.close()
+            return jsonify(transactions)
+        else:
+            conn = get_sqlite_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM transactions ORDER BY id")
+            rows = cur.fetchall()
+            transactions = []
+            for row in rows:
+                cur.execute("""SELECT item_id, item_name, quantity, price
+                               FROM transaction_items WHERE transaction_id = ?""",
+                            (row["id"],))
+                items = cur.fetchall()
+                transactions.append(
+                    {
+                        "id": row["id"],
+                        "timestamp": row["timestamp"],
+                        "items": [{"id": item["item_id"], "name": item["item_name"], "quantity": item["quantity"], "price": item["price"]} for item in items],
+                        "tender": row["tender"],
+                        "total": row["total"],
+                    }
+                )
+            conn.close()
+            return jsonify(transactions)
     except Exception:
         logger.exception("Error fetching transactions")
         return jsonify({"error": "Internal server error while fetching transactions"}), 500
@@ -190,37 +241,38 @@ def get_transactions():
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
     try:
-        stats = {
-            "cash": {"count": 0, "total": 0},
-            "check": {"count": 0, "total": 0},
-            "venmo": {"count": 0, "total": 0},
-        }
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT tender, total FROM transactions")
-        rows = cursor.fetchall()
-        conn.close()
-
-        for row in rows:
-            tender = row["tender"]
-            if tender not in stats:
-                # Add unexpected tender types safely
-                stats[tender] = {"count": 0, "total": 0}
-            stats[tender]["count"] += 1
-            stats[tender]["total"] += row["total"]
+        stats = {"cash": {"count": 0, "total": 0}, "check": {"count": 0, "total": 0}, "venmo": {"count": 0, "total": 0}}
+        if USING_POSTGRES:
+            conn, cur = get_postgres_conn()
+            cur.execute("SELECT tender, total FROM transactions;")
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            for row in rows:
+                t = row["tender"]
+                if t not in stats:
+                    stats[t] = {"count": 0, "total": 0}
+                stats[t]["count"] += 1
+                stats[t]["total"] += float(row["total"])
+        else:
+            conn = get_sqlite_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT tender, total FROM transactions")
+            rows = cur.fetchall()
+            conn.close()
+            for row in rows:
+                tender = row["tender"]
+                stats[tender]["count"] += 1
+                stats[tender]["total"] += row["total"]
 
         overall_total = sum(stats[t]["total"] for t in stats)
         overall_count = sum(stats[t]["count"] for t in stats)
-
-        return jsonify(
-            {"by_tender": stats, "overall": {"count": overall_count, "total": round(overall_total, 2)}}
-        )
+        return jsonify({"by_tender": stats, "overall": {"count": overall_count, "total": round(overall_total, 2)}})
     except Exception:
         logger.exception("Error computing stats")
         return jsonify({"error": "Internal server error while computing stats"}), 500
 
-# Serve frontend app (if built) for SPA routes
+# Serve frontend for SPA
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_frontend(path):
@@ -229,6 +281,5 @@ def serve_frontend(path):
     return send_from_directory(app.static_folder, path)
 
 if __name__ == "__main__":
-    # Only used when running directly with python app.py
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
