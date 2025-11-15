@@ -11,7 +11,7 @@ function App() {
   const [selectedItem, setSelectedItem] = useState(null);
   const [priceInput, setPriceInput] = useState("");
 
-  const API_BASE = "http://localhost:5000";
+  const API_BASE = "";
 
   useEffect(() => {
     // Fetch items from backend
