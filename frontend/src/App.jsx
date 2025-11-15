@@ -299,6 +299,26 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* API Links */}
+      <div className="api-links">
+        <a
+          href="https://church-pos.onrender.com/api/stats"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="api-link-btn"
+        >
+          View Stats
+        </a>
+        <a
+          href="https://church-pos.onrender.com/api/transactions"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="api-link-btn"
+        >
+          View Transactions
+        </a>
+      </div>
     </div>
   );
 }
