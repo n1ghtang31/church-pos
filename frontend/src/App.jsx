@@ -11,7 +11,7 @@ function App() {
   const [selectedItem, setSelectedItem] = useState(null);
   const [priceInput, setPriceInput] = useState("");
 
-  const API_BASE = "";
+  const API_BASE = "https://church-pos.onrender.com";
 
   useEffect(() => {
     // Fetch items from backend
