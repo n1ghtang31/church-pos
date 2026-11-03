@@ -1,7 +1,15 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import "./App.css";
+import Cashiers from "./Cashiers";
+import Login from "./Login";
+import Reports from "./Reports";
 
 function App() {
+  const [authenticated, setAuthenticated] = useState(null);
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState("register");
+  const [submitting, setSubmitting] = useState(false);
+  const checkoutInFlight = useRef(false);
   const [items, setItems] = useState([]);
   const [cart, setCart] = useState([]);
   const [tender, setTender] = useState("cash");
@@ -11,12 +19,43 @@ function App() {
   const [selectedItem, setSelectedItem] = useState(null);
   const [priceInput, setPriceInput] = useState("");
 
-  const API_BASE = "https://church-pos.onrender.com";
+  // Send the user back to the login screen if their session has expired
+  const api = async (path, options) => {
+    const response = await fetch(path, options);
+    if (response.status === 401) {
+      setAuthenticated(false);
+    }
+    return response;
+  };
+
+  const startSession = (session) => {
+    setUser(session);
+    setView(session.role === "admin" ? "cashiers" : "register");
+    setAuthenticated(session.authenticated);
+  };
 
   useEffect(() => {
-    // Fetch items from backend
-    fetch(`${API_BASE}/api/items`)
+    fetch("/api/session")
       .then((response) => response.json())
+      .then(startSession)
+      .catch((error) => {
+        console.error("Error checking session:", error);
+        setAuthenticated(false);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!authenticated) {
+      return;
+    }
+    // Fetch items from backend
+    fetch("/api/items")
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`Status ${response.status}`);
+        }
+        return response.json();
+      })
       .then((data) => {
         setItems(data);
         // Set first department as active tab
@@ -25,8 +64,19 @@ function App() {
           setActiveTab(departments[0]);
         }
       })
-      .catch((error) => console.error("Error fetching items:", error));
-  }, []);
+      .catch((error) => {
+        console.error("Error fetching items:", error);
+        setMessage("Could not load items from the server");
+      });
+  }, [authenticated]);
+
+  const logout = async () => {
+    await fetch("/api/logout", { method: "POST" });
+    // The next cashier starts with an empty register
+    setCart([]);
+    setMessage("");
+    setAuthenticated(false);
+  };
 
   // Get unique departments
   const departments = [...new Set(items.map((item) => item.department))];
@@ -47,7 +97,10 @@ function App() {
   };
 
   const handleNumberClick = (num) => {
-    setPriceInput((prev) => prev + num);
+    // Allow only one decimal point and two decimal places
+    setPriceInput((prev) =>
+      /^\d*(\.\d{0,2})?$/.test(prev + num) ? prev + num : prev,
+    );
   };
 
   const handleBackspace = () => {
@@ -99,6 +152,10 @@ function App() {
   };
 
   const checkout = async () => {
+    // A ref updates immediately, so a double click can't record the sale twice
+    if (checkoutInFlight.current) {
+      return;
+    }
     if (cart.length === 0) {
       setMessage("Cart is empty!");
       return;
@@ -114,8 +171,10 @@ function App() {
       tender: tender,
     };
 
+    checkoutInFlight.current = true;
+    setSubmitting(true);
     try {
-      const response = await fetch(`${API_BASE}/api/transactions`, {
+      const response = await api("/api/transactions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(transaction),
@@ -123,7 +182,7 @@ function App() {
 
       if (response.ok) {
         const result = await response.json();
-        setMessage(`Transaction completed! Total: $${result.total}`);
+        setMessage(`Transaction completed! Total: $${result.total.toFixed(2)}`);
         setCart([]);
       } else {
         setMessage("Error processing transaction");
@@ -131,14 +190,58 @@ function App() {
     } catch (error) {
       console.error("Error:", error);
       setMessage("Error connecting to server");
+    } finally {
+      checkoutInFlight.current = false;
+      setSubmitting(false);
     }
   };
+
+  if (authenticated === null) {
+    return null;
+  }
+
+  if (!authenticated) {
+    return <Login onLogin={startSession} />;
+  }
 
   return (
     <div className="pos-container">
       <h1>Church Charity Drive POS</h1>
 
-      <div className="pos-layout">
+      <nav className="app-nav">
+        {user?.role === "cashier" && (
+          <button
+            className={`tab-button ${view === "register" ? "active" : ""}`}
+            onClick={() => setView("register")}
+          >
+            Register
+          </button>
+        )}
+        {user?.role === "admin" && (
+          <button
+            className={`tab-button ${view === "cashiers" ? "active" : ""}`}
+            onClick={() => setView("cashiers")}
+          >
+            Cashiers
+          </button>
+        )}
+        <button
+          className={`tab-button ${view === "reports" ? "active" : ""}`}
+          onClick={() => setView("reports")}
+        >
+          Reports
+        </button>
+        <span className="nav-user">{user?.name}</span>
+        <button className="tab-button" onClick={logout}>
+          Log Out
+        </button>
+      </nav>
+
+      {view === "cashiers" && <Cashiers api={api} />}
+
+      {view === "reports" && <Reports api={api} />}
+
+      {view === "register" && <div className="pos-layout">
         <div className="items-section">
           <h2>Items</h2>
 
@@ -249,13 +352,17 @@ function App() {
             </div>
           </div>
 
-          <button className="checkout-btn" onClick={checkout}>
-            Complete Transaction
+          <button
+            className="checkout-btn"
+            onClick={checkout}
+            disabled={submitting}
+          >
+            {submitting ? "Processing..." : "Complete Transaction"}
           </button>
 
           {message && <div className="message">{message}</div>}
         </div>
-      </div>
+      </div>}
 
       {/* Number Pad Modal */}
       {showNumberPad && (
@@ -299,34 +406,6 @@ function App() {
           </div>
         </div>
       )}
-
-      {/* API Links */}
-      <div className="api-links">
-        <a
-          href="https://church-pos.onrender.com/api/stats"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="api-link-btn"
-        >
-          View Stats
-        </a>
-        <a
-          href="https://church-pos.onrender.com/api/transactions"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="api-link-btn"
-        >
-          View Transactions
-        </a>
-        <a
-          href="https://church-pos.onrender.com/api/item-sales"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="api-link-btn"
-        >
-          View Item Sales
-        </a>
-      </div>
     </div>
   );
 }

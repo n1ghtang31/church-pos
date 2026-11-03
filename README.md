@@ -1,96 +1,127 @@
 # Church POS - Charity Drive Point of Sale System
 
-A simple POS system for church charity drives with 10 items and 3 payment tender types (cash, check, venmo).
+A password-protected point of sale for church charity drives. Cashiers pick an item, type the amount, and take cash, check, or Venmo. There are no tax calculations.
 
-## Features
+- React frontend, served by a Flask backend
+- SQLite database stored on a Docker volume
+- Each cashier logs in with their own PIN, and sales record who rang them up
+- Daily multi-total and single-item reports
 
-- 10 pre-configured charity items
-- 3 payment tender types: Cash, Check, and Venmo
-- No tax calculations (as specified)
-- Simple, bare-bones React frontend
-- Flask Python backend with SQLite database for persistent transaction storage
+## Running on a server (Docker)
 
-## Setup and Running
+Requires Docker with the Compose plugin.
 
-### Backend (Flask)
+1. Create your settings file:
+   ```bash
+   cp .env.example .env
+   ```
+2. In `.env`, set `ADMIN_CODE` to the code that manages cashiers, and set `SECRET_KEY` to the output of `openssl rand -hex 32`. Check that `POS_TIMEZONE` is correct, because it decides which day a sale counts toward in reports.
+3. Build and start:
+   ```bash
+   docker compose up -d --build
+   ```
+4. Open `http://<server-ip>:5000` from any device on the network.
 
-1. Install Python dependencies:
+The container restarts automatically unless you stop it. To update after a code change, run step 3 again. Sales data is kept.
+
+This serves plain HTTP, so only run it on a network you trust. If it will be reachable from the internet, put it behind an HTTPS reverse proxy and set `COOKIE_SECURE=true`.
+
+## Cashiers
+
+Type the admin code on the login screen to add, edit, and remove cashiers. No one can ring up sales until at least one cashier exists. The admin code can also view reports, but sales must be rung up under a cashier's PIN.
+
+- PINs are 4 to 8 digits, and each cashier's PIN must be different.
+- PINs can't be viewed after they're saved. If one is forgotten, set a new one.
+- Removing a cashier logs them out right away. Their past sales stay in the reports and keep their name.
+- Changing `SECRET_KEY` makes every PIN stop working, so they'd all need to be set again.
+
+## Data and backups
+
+Sales are stored in the `church-pos-data` Docker volume, which survives restarts, rebuilds, and `docker compose down`. **`docker compose down -v` deletes it.**
+
+To back up to the current folder:
+
+```bash
+docker compose exec web python -c "import sqlite3; sqlite3.connect('/data/church_pos.db').backup(sqlite3.connect('/data/backup.db'))"
+docker compose cp web:/data/backup.db "./church_pos_backup_$(date +%F).db"
+```
+
+Keep a copy somewhere other than the server.
+
+To restore a backup, replacing all current data:
+
+```bash
+docker compose cp ./church_pos_backup.db web:/data/restore.db
+docker compose exec web python -c "import sqlite3; sqlite3.connect('/data/restore.db').backup(sqlite3.connect('/data/church_pos.db'))"
+docker compose restart web
+```
+
+## Reports
+
+Open the **Reports** tab after logging in. It shows today by default, and you can pick a date range or all dates, then print.
+
+- **Daily Multi-Total:** sales count, each payment method, and the total for each day
+- **Payment Method Totals:** count and total for cash, check, and Venmo
+- **Cashier Totals:** sales count and total per cashier, using the name they had when each sale was made
+- **Department Totals:** quantity and total per department
+- **Single Item Totals:** quantity and total per item, including donations
+
+## Local development
+
+Start the backend:
+
 ```bash
 pip install -r requirements.txt
+ADMIN_CODE=<your code> SECRET_KEY=dev python app.py
 ```
 
-2. Run the Flask server:
-```bash
-python app.py
-```
+In a second terminal, start the frontend:
 
-The backend will start on `http://localhost:5000`
-
-**Note:** This runs Flask in debug mode for development. For production use, disable debug mode and use a production WSGI server like Gunicorn.
-
-### Frontend (React)
-
-1. Navigate to the frontend directory:
 ```bash
 cd frontend
-```
-
-2. Install dependencies (if not already done):
-```bash
 npm install
-```
-
-3. Start the development server:
-```bash
 npm run dev
 ```
 
-The frontend will start on `http://localhost:5173`
+Open `http://localhost:5175`. Vite forwards `/api` requests to Flask on port 5001, which avoids the macOS AirPlay Receiver on port 5000.
 
-## Usage
+Run the backend tests with:
 
-1. Start both the backend (Flask) and frontend (React) servers
-2. Open your browser to the frontend URL (typically `http://localhost:5173`)
-3. Click on items to add them to the cart
-4. Adjust quantities using the + and - buttons
-5. Select a payment tender type (Cash, Check, or Venmo)
-6. Click "Complete Transaction" to process the sale
+```bash
+python -m unittest test_app
+```
 
-## API Endpoints
+## API
 
-### GET /api/items
-Returns the list of all 10 available items.
+All endpoints except login, session, and health require a logged-in session.
 
-### POST /api/transactions
-Creates a new transaction. Expects:
+| Endpoint | Description |
+|---|---|
+| `POST /api/login` | Log in with `{"code": "..."}`, using a cashier PIN or the admin code |
+| `POST /api/logout` | Log out |
+| `GET /api/session` | Whether this browser is logged in |
+| `GET /api/health` | Health check used by Docker |
+| `GET`, `POST /api/cashiers` | List or add cashiers (admin only) |
+| `PUT`, `DELETE /api/cashiers/<id>` | Edit or remove a cashier (admin only) |
+| `GET /api/items` | Items available to ring up |
+| `POST /api/transactions` | Record a sale (cashier only) |
+| `GET /api/transactions` | All sales with their items |
+| `GET /api/reports/summary?start=YYYY-MM-DD&end=YYYY-MM-DD` | Report totals; both dates are optional |
+| `GET /api/stats` | All-time totals by payment method |
+| `GET /api/item-sales` | All-time totals by item |
+
+A sale looks like this, with the price entered at the register:
+
 ```json
 {
-  "items": [{"id": 1, "quantity": 2}],
+  "items": [{"id": 9, "quantity": 1, "price": 25.00}],
   "tender": "cash"
 }
 ```
 
-### GET /api/transactions
-Returns all completed transactions.
+## Items
 
-### GET /api/stats
-Returns statistics grouped by tender type.
+Items are defined in `ITEMS` in `app.py`. Keep existing IDs unchanged so past sales stay matched to their department.
 
-## Data Persistence
-
-Transaction data is stored in a SQLite database (`church_pos.db`) which is automatically created when the server starts. This ensures that all transaction history is preserved even when the server is restarted.
-
-**Note:** The database file is excluded from version control via `.gitignore`.
-
-## Items List
-
-1. Candles - $5.00
-2. Prayer Book - $10.00
-3. Rosary Beads - $8.00
-4. Cross Pendant - $12.00
-5. Holy Water Bottle - $3.00
-6. Devotional Cards - $2.00
-7. Scripture Journal - $15.00
-8. Blessed Oil - $6.00
-9. Religious Art Print - $20.00
-10. Charity Bracelet - $4.00
+- **Food:** Nuts, Baked Goods, Honey, Jam
+- **Misc:** Rada, Mom & Pop Shop, Danny Duzits, Crafts, Donation

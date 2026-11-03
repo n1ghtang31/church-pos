@@ -7,5 +7,8 @@ export default defineConfig({
   server: {
     host: "0.0.0.0", // Listen on the local network
     port: 5175,
+    proxy: {
+      "/api": "http://localhost:5001", // Flask backend during development
+    },
   },
 });
