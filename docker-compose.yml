@@ -9,6 +9,7 @@ services:
       - ADMIN_CODE=${ADMIN_CODE:?Set ADMIN_CODE in .env}
       - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env}
       - COOKIE_SECURE=${COOKIE_SECURE:-false}
+      - TRUSTED_PROXY_IPS=${TRUSTED_PROXY_IPS:-}
       - TZ=${POS_TIMEZONE:-America/Chicago}
     restart: unless-stopped
 

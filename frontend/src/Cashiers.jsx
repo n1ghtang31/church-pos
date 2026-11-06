@@ -110,7 +110,7 @@ function Cashiers({ api }) {
             />
           </label>
           <label>
-            PIN (4 to 8 digits)
+            PIN (6 to 8 digits)
             <input
               type="password"
               inputMode="numeric"

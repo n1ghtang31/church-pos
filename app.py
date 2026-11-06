@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import sqlite3
@@ -25,6 +26,15 @@ ADMIN_CODE = os.environ.get("ADMIN_CODE")
 SECRET_KEY = os.environ.get("SECRET_KEY")
 if not ADMIN_CODE or not SECRET_KEY:
     raise RuntimeError("ADMIN_CODE and SECRET_KEY environment variables must be set")
+if not re.fullmatch(r"[A-Za-z0-9]{8,32}", ADMIN_CODE):
+    raise RuntimeError("ADMIN_CODE must be 8 to 32 letters or digits")
+
+# Reverse proxies (such as nginx) whose X-Forwarded-For header is trusted, as IPs or CIDRs
+TRUSTED_PROXY_IPS = [
+    ipaddress.ip_network(proxy.strip(), strict=False)
+    for proxy in os.environ.get("TRUSTED_PROXY_IPS", "").split(",")
+    if proxy.strip()
+]
 
 app.config.update(
     SECRET_KEY=SECRET_KEY,
@@ -32,13 +42,14 @@ app.config.update(
     # Set COOKIE_SECURE=true when serving over HTTPS
     SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    MAX_CONTENT_LENGTH=64 * 1024,
 )
 
 PUBLIC_API_PATHS = {"/api/login", "/api/session", "/api/health"}
 
 # Failed login tracking, kept per process (the container runs a single worker)
 MAX_LOGIN_FAILURES = 5
-LOGIN_LOCKOUT_SECONDS = 60
+LOGIN_LOCKOUT_SECONDS = 5 * 60
 login_failures = {}
 login_failures_lock = threading.Lock()
 
@@ -127,6 +138,23 @@ def get_db_connection():
 # If this fails, let it bubble so the process fails fast and logs show the problem.
 init_db()
 
+def client_ip():
+    """The visitor's IP address.
+
+    Behind a trusted proxy, use the last X-Forwarded-For entry, which is the one the
+    proxy itself added. Anyone else's header is ignored so it can't be faked.
+    """
+    remote = request.remote_addr
+    try:
+        trusted = any(ipaddress.ip_address(remote) in net for net in TRUSTED_PROXY_IPS)
+    except ValueError:
+        trusted = False
+    if trusted:
+        forwarded = request.headers.get("X-Forwarded-For", "").split(",")[-1].strip()
+        if forwarded:
+            return forwarded
+    return remote
+
 def is_locked_out(ip):
     with login_failures_lock:
         failure = login_failures.get(ip)
@@ -140,6 +168,11 @@ def is_locked_out(ip):
 
 def record_login_failure(ip):
     with login_failures_lock:
+        # Forget expired failures so many different addresses can't grow this forever
+        if len(login_failures) > 10000:
+            now = time.monotonic()
+            for key in [k for k, (_, last) in login_failures.items() if now - last >= LOGIN_LOCKOUT_SECONDS]:
+                del login_failures[key]
         count, _ = login_failures.get(ip, (0, 0))
         login_failures[ip] = (count + 1, time.monotonic())
 
@@ -163,6 +196,21 @@ def current_user():
             return {"role": "cashier", "name": cashier["name"]}
         session.clear()
     return None
+
+@app.after_request
+def add_security_headers(response):
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    )
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if app.config["SESSION_COOKIE_SECURE"]:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    if request.path.startswith("/api/"):
+        # Keep sales data out of browser and proxy caches
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 @app.before_request
 def require_login():
@@ -195,9 +243,10 @@ def get_session():
 
 @app.route("/api/login", methods=["POST"])
 def login():
-    ip = request.remote_addr
+    ip = client_ip()
     if is_locked_out(ip):
-        return jsonify({"error": "Too many attempts. Try again in a minute."}), 429
+        logger.warning("Login blocked for %s after too many failed attempts", ip)
+        return jsonify({"error": "Too many attempts. Try again in 5 minutes."}), 429
 
     data = request.get_json(silent=True)
     code = data.get("code") if isinstance(data, dict) else None
@@ -216,6 +265,7 @@ def login():
                 role = "cashier"
 
     if not role:
+        logger.warning("Failed login from %s", ip)
         record_login_failure(ip)
         return jsonify({"error": "Incorrect code"}), 401
 
@@ -240,8 +290,8 @@ def clean_cashier_name(name):
     return name.strip()
 
 def clean_cashier_pin(pin):
-    if not isinstance(pin, str) or not re.fullmatch(r"[0-9]{4,8}", pin):
-        raise ValueError("PIN must be 4 to 8 digits")
+    if not isinstance(pin, str) or not re.fullmatch(r"[0-9]{6,8}", pin):
+        raise ValueError("PIN must be 6 to 8 digits")
     if hmac.compare_digest(pin.encode(), ADMIN_CODE.encode()):
         raise ValueError("That PIN is not available")
     return pin

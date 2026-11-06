@@ -4,7 +4,7 @@ import unittest
 
 _tmp = tempfile.TemporaryDirectory()
 os.environ["DB_FILE"] = os.path.join(_tmp.name, "test.db")
-os.environ["ADMIN_CODE"] = "9999"
+os.environ["ADMIN_CODE"] = "99990000"
 os.environ["SECRET_KEY"] = "test-secret"
 
 import app as pos
@@ -18,13 +18,13 @@ class PosTestCase(unittest.TestCase):
         conn.execute("DELETE FROM transactions")
         conn.execute("DELETE FROM cashiers")
         conn.execute(
-            "INSERT INTO cashiers (name, pin_hash) VALUES (?, ?)", ("Pat", pos.hash_pin("1234"))
+            "INSERT INTO cashiers (name, pin_hash) VALUES (?, ?)", ("Pat", pos.hash_pin("123456"))
         )
         conn.commit()
         conn.close()
         self.client = pos.app.test_client()
 
-    def login(self, code="1234"):
+    def login(self, code="123456"):
         response = self.client.post("/api/login", json={"code": code})
         self.assertEqual(response.status_code, 200)
         return response.json
@@ -65,14 +65,14 @@ class AuthTests(PosTestCase):
     def test_lockout_after_repeated_failures(self):
         for _ in range(pos.MAX_LOGIN_FAILURES):
             self.client.post("/api/login", json={"code": "0000"})
-        response = self.client.post("/api/login", json={"code": "1234"})
+        response = self.client.post("/api/login", json={"code": "123456"})
         self.assertEqual(response.status_code, 429)
 
 
 class CashierTests(PosTestCase):
     def setUp(self):
         super().setUp()
-        self.login("9999")
+        self.login("99990000")
 
     def cashier_client(self, code):
         client = pos.app.test_client()
@@ -85,10 +85,10 @@ class CashierTests(PosTestCase):
         self.assertEqual(self.client.get("/api/session").json["role"], "admin")
 
     def test_cashier_cannot_manage_cashiers(self):
-        client, response = self.cashier_client("1234")
+        client, response = self.cashier_client("123456")
         self.assertEqual(response.json["name"], "Pat")
         self.assertEqual(client.get("/api/cashiers").status_code, 403)
-        self.assertEqual(client.post("/api/cashiers", json={"name": "Eve", "pin": "5555"}).status_code, 403)
+        self.assertEqual(client.post("/api/cashiers", json={"name": "Eve", "pin": "555555"}).status_code, 403)
         self.assertEqual(client.delete(f"/api/cashiers/{self.cashier_id('Pat')}").status_code, 403)
 
     def test_logged_out_cannot_manage_cashiers(self):
@@ -98,59 +98,106 @@ class CashierTests(PosTestCase):
         self.assertEqual(self.sell([{"id": 1, "price": 5}]).status_code, 403)
 
     def test_create_cashier_and_log_in(self):
-        response = self.client.post("/api/cashiers", json={"name": " Sam ", "pin": "5555"})
+        response = self.client.post("/api/cashiers", json={"name": " Sam ", "pin": "555555"})
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json["name"], "Sam")
         self.assertNotIn("pin", response.json)
         self.assertNotIn("pin_hash", response.json)
-        _, login = self.cashier_client("5555")
+        _, login = self.cashier_client("555555")
         self.assertEqual(login.json["role"], "cashier")
 
     def test_invalid_cashiers_rejected(self):
         bad = [
-            {"name": "", "pin": "5555"},
+            {"name": "", "pin": "555555"},
             {"name": "Sam", "pin": "123"},
+            {"name": "Sam", "pin": "12345"},
             {"name": "Sam", "pin": "12345678901"},
             {"name": "Sam", "pin": "abcd"},
             {"name": "Sam", "pin": 5555},
-            {"name": "Sam", "pin": "9999"},
+            {"name": "Sam", "pin": "99990000"},
             {"name": "Sam"},
         ]
         for body in bad:
             self.assertEqual(self.client.post("/api/cashiers", json=body).status_code, 400, body)
 
     def test_duplicates_rejected(self):
-        self.assertEqual(self.client.post("/api/cashiers", json={"name": "PAT", "pin": "5555"}).status_code, 409)
-        self.assertEqual(self.client.post("/api/cashiers", json={"name": "Sam", "pin": "1234"}).status_code, 409)
+        self.assertEqual(self.client.post("/api/cashiers", json={"name": "PAT", "pin": "555555"}).status_code, 409)
+        self.assertEqual(self.client.post("/api/cashiers", json={"name": "Sam", "pin": "123456"}).status_code, 409)
 
     def test_edit_name_keeps_pin(self):
         cashier_id = self.cashier_id("Pat")
         response = self.client.put(f"/api/cashiers/{cashier_id}", json={"name": "Patricia"})
         self.assertEqual(response.json["name"], "Patricia")
-        _, login = self.cashier_client("1234")
+        _, login = self.cashier_client("123456")
         self.assertEqual(login.json["name"], "Patricia")
 
     def test_edit_pin_replaces_old_pin(self):
         cashier_id = self.cashier_id("Pat")
-        self.assertEqual(self.client.put(f"/api/cashiers/{cashier_id}", json={"pin": "7777"}).status_code, 200)
-        self.assertEqual(self.cashier_client("1234")[1].status_code, 401)
-        self.assertEqual(self.cashier_client("7777")[1].status_code, 200)
+        self.assertEqual(self.client.put(f"/api/cashiers/{cashier_id}", json={"pin": "777777"}).status_code, 200)
+        self.assertEqual(self.cashier_client("123456")[1].status_code, 401)
+        self.assertEqual(self.cashier_client("777777")[1].status_code, 200)
 
     def test_edit_missing_cashier(self):
         self.assertEqual(self.client.put("/api/cashiers/99999", json={"name": "Nobody"}).status_code, 404)
         self.assertEqual(self.client.delete("/api/cashiers/99999").status_code, 404)
 
     def test_remove_logs_cashier_out_and_keeps_their_sales(self):
-        client, _ = self.cashier_client("1234")
+        client, _ = self.cashier_client("123456")
         client.post("/api/transactions", json={"items": [{"id": 1, "price": 5}], "tender": "cash"})
 
         self.assertEqual(self.client.delete(f"/api/cashiers/{self.cashier_id('Pat')}").status_code, 204)
 
         self.assertEqual(client.get("/api/items").status_code, 401)
         self.assertFalse(client.get("/api/session").json["authenticated"])
-        self.assertEqual(self.cashier_client("1234")[1].status_code, 401)
+        self.assertEqual(self.cashier_client("123456")[1].status_code, 401)
         sales = self.client.get("/api/transactions").json
         self.assertEqual(sales[0]["cashier"], "Pat")
+
+
+class SecurityTests(PosTestCase):
+    def tearDown(self):
+        pos.TRUSTED_PROXY_IPS = []
+
+    def fail_login(self, ip, forwarded=None):
+        headers = {"X-Forwarded-For": forwarded} if forwarded else {}
+        return self.client.post(
+            "/api/login", json={"code": "000000"}, headers=headers, environ_base={"REMOTE_ADDR": ip}
+        )
+
+    def lock_out(self, ip, forwarded=None):
+        for _ in range(pos.MAX_LOGIN_FAILURES):
+            self.fail_login(ip, forwarded)
+
+    def test_forwarded_header_ignored_without_trusted_proxy(self):
+        self.lock_out("10.0.0.5", forwarded="1.1.1.1")
+        self.assertEqual(self.fail_login("10.0.0.5", forwarded="2.2.2.2").status_code, 429)
+
+    def test_trusted_proxy_locks_out_only_the_visitor(self):
+        pos.TRUSTED_PROXY_IPS = [pos.ipaddress.ip_network("10.0.0.5/32")]
+        self.lock_out("10.0.0.5", forwarded="1.1.1.1")
+        self.assertEqual(self.fail_login("10.0.0.5", forwarded="1.1.1.1").status_code, 429)
+        self.assertEqual(self.fail_login("10.0.0.5", forwarded="2.2.2.2").status_code, 401)
+
+    def test_trusted_proxy_uses_the_entry_it_added(self):
+        pos.TRUSTED_PROXY_IPS = [pos.ipaddress.ip_network("10.0.0.0/24")]
+        self.lock_out("10.0.0.5", forwarded="9.9.9.9, 1.1.1.1")
+        self.assertEqual(self.fail_login("10.0.0.5", forwarded="8.8.8.8, 1.1.1.1").status_code, 429)
+
+    def test_untrusted_sender_cannot_fake_forwarded_header(self):
+        pos.TRUSTED_PROXY_IPS = [pos.ipaddress.ip_network("10.0.0.5/32")]
+        self.lock_out("10.0.0.9", forwarded="1.1.1.1")
+        self.assertEqual(self.fail_login("10.0.0.9", forwarded="2.2.2.2").status_code, 429)
+
+    def test_security_headers(self):
+        response = self.client.get("/api/health")
+        self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+        self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_large_requests_rejected(self):
+        response = self.client.post("/api/login", data="x" * 100_000, content_type="application/json")
+        self.assertEqual(response.status_code, 413)
 
 
 class TransactionTests(PosTestCase):
@@ -237,12 +284,12 @@ class ReportTests(PosTestCase):
     def test_cashier_totals(self):
         conn = pos.get_db_connection()
         conn.execute(
-            "INSERT INTO cashiers (name, pin_hash) VALUES (?, ?)", ("Sam", pos.hash_pin("5555"))
+            "INSERT INTO cashiers (name, pin_hash) VALUES (?, ?)", ("Sam", pos.hash_pin("555555"))
         )
         conn.commit()
         conn.close()
         other = pos.app.test_client()
-        other.post("/api/login", json={"code": "5555"})
+        other.post("/api/login", json={"code": "555555"})
         sale = other.post(
             "/api/transactions", json={"items": [{"id": 3, "price": 7.25}], "tender": "cash"}
         ).json
@@ -335,7 +382,7 @@ class RefundTests(PosTestCase):
 
     def test_refund_shows_who_processed_it(self):
         self.client.post("/api/logout")
-        self.login("9999")
+        self.login("99990000")
         response = self.refund()
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json["cashier"], "Admin")

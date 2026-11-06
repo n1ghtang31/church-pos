@@ -76,10 +76,10 @@ ask_admin_code() {
     die "No terminal to ask for ADMIN_CODE. Set ADMIN_CODE=... to run without prompts."
   fi
   while [[ -z ${ADMIN_CODE:-} ]]; do
-    read -r -s -p "   Admin code, used to manage cashiers (4-32 letters or digits): " ADMIN_CODE </dev/tty
+    read -r -s -p "   Admin code, used to manage cashiers (8-32 letters or digits): " ADMIN_CODE </dev/tty
     printf '\n'
-    if [[ ! $ADMIN_CODE =~ ^[A-Za-z0-9]{4,32}$ ]]; then
-      printf '   It must be 4 to 32 letters or digits.\n'
+    if [[ ! $ADMIN_CODE =~ ^[A-Za-z0-9]{8,32}$ ]]; then
+      printf '   It must be 8 to 32 letters or digits.\n'
       ADMIN_CODE=""
       continue
     fi
@@ -90,7 +90,7 @@ ask_admin_code() {
       ADMIN_CODE=""
     fi
   done
-  [[ $ADMIN_CODE =~ ^[A-Za-z0-9]{4,32}$ ]] || die "ADMIN_CODE must be 4 to 32 letters or digits"
+  [[ $ADMIN_CODE =~ ^[A-Za-z0-9]{8,32}$ ]] || die "ADMIN_CODE must be 8 to 32 letters or digits"
 }
 
 # First active storage that holds the given content type, preferring $2
@@ -135,6 +135,10 @@ validate_settings() {
   fi
   [[ -f /usr/share/zoneinfo/$POS_TIMEZONE ]] || die "Unknown timezone: $POS_TIMEZONE"
   [[ $POS_PORT =~ ^[0-9]+$ && $POS_PORT -ge 1 && $POS_PORT -le 65535 ]] || die "Port must be between 1 and 65535"
+  [[ $USE_PROXY =~ ^(yes|no)$ ]] || die "USE_PROXY must be yes or no"
+  if [[ $USE_PROXY == yes ]]; then
+    [[ $PROXY_IP =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || die "Reverse proxy IP must look like 192.168.1.10"
+  fi
 }
 
 write_env() {
@@ -158,8 +162,12 @@ POS_TIMEZONE=$POS_TIMEZONE
 # Port on the server
 POS_PORT=$POS_PORT
 
-# Set to true only if the app is served over HTTPS
-COOKIE_SECURE=false
+# True when served over HTTPS through a reverse proxy. Logins then only work
+# through the HTTPS address.
+COOKIE_SECURE=$COOKIE_SECURE
+
+# Reverse proxy whose X-Forwarded-For header is trusted
+TRUSTED_PROXY_IPS=$TRUSTED_PROXY_IPS
 EOF
   pct push "$CTID" "$env_file" "$APP_DIR/.env" --perms 600 || { rm -f "$env_file"; return 1; }
   rm -f "$env_file"
@@ -254,15 +262,34 @@ main() {
   printf '\n%sChurch POS%s\n' "$BOLD" "$RESET"
   ask POS_TIMEZONE "Timezone for daily reports" "$(host_timezone)"
   ask POS_PORT "Web port" 5000
+  ask USE_PROXY "Reached through an HTTPS reverse proxy such as nginx? (yes/no)" "yes"
+  USE_PROXY=$(tr '[:upper:]' '[:lower:]' <<<"$USE_PROXY")
+  [[ $USE_PROXY == y ]] && USE_PROXY=yes
+  [[ $USE_PROXY == n ]] && USE_PROXY=no
+  if [[ $USE_PROXY == yes ]]; then
+    ask PROXY_IP "IP address of the reverse proxy" ""
+  fi
   ask_admin_code
 
   validate_settings
+  if [[ $USE_PROXY == yes ]]; then
+    COOKIE_SECURE=true
+    TRUSTED_PROXY_IPS=$PROXY_IP
+  else
+    COOKIE_SECURE=false
+    TRUSTED_PROXY_IPS=""
+  fi
 
   printf '\n%sReady to create:%s\n' "$BOLD" "$RESET"
   printf '   Container %s (%s): %s cores, %s MB memory, %s GB on %s\n' \
     "$CTID" "$CT_HOSTNAME" "$CORES" "$MEMORY_MB" "$DISK_GB" "$ROOT_STORAGE"
   printf '   Network: %s on %s\n' "$IP_ADDRESS" "$BRIDGE"
-  printf '   Church POS from the %s branch, port %s, timezone %s\n\n' "$BRANCH" "$POS_PORT" "$POS_TIMEZONE"
+  printf '   Church POS from the %s branch, port %s, timezone %s\n' "$BRANCH" "$POS_PORT" "$POS_TIMEZONE"
+  if [[ $USE_PROXY == yes ]]; then
+    printf '   HTTPS through the reverse proxy at %s\n\n' "$PROXY_IP"
+  else
+    printf '   Local network only, over plain HTTP\n\n'
+  fi
   ask CONFIRM "Continue? (yes/no)" "no"
   [[ $CONFIRM =~ ^[Yy]([Ee][Ss])?$ ]] || die "Cancelled. Nothing was changed."
 
@@ -301,7 +328,8 @@ main() {
   wait_for "Waiting for the network" "getent hosts deb.debian.org" 30
 
   step "Updating Debian" in_ct "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold full-upgrade"
-  step "Installing tools" in_ct "DEBIAN_FRONTEND=noninteractive apt-get install -y curl git ca-certificates cron"
+  step "Installing tools" in_ct "DEBIAN_FRONTEND=noninteractive apt-get install -y curl git ca-certificates cron unattended-upgrades"
+  step "Turning on automatic security updates" in_ct "printf 'APT::Periodic::Update-Package-Lists \"1\";\nAPT::Periodic::Unattended-Upgrade \"1\";\n' >/etc/apt/apt.conf.d/20auto-upgrades"
   step "Installing Docker" in_ct "curl -fsSL https://get.docker.com | sh"
 
   msg_info "Checking that Docker can run here"
@@ -324,12 +352,26 @@ main() {
     address=${IP_ADDRESS%/*}
   fi
 
-  cat <<EOF
+  if [[ $USE_PROXY == yes ]]; then
+    cat <<EOF
+
+${GREEN}${BOLD}Church POS is running.${RESET}
+
+  Point your nginx site at:  ${BOLD}http://$address:$POS_PORT${RESET}
+  Then open your HTTPS address and log in with your admin code to add cashiers.
+  Logins only work through HTTPS. The README's "Hosting publicly" section has
+  an example nginx config and a check that visitors' addresses come through.
+EOF
+  else
+    cat <<EOF
 
 ${GREEN}${BOLD}Church POS is running.${RESET}
 
   Open:  ${BOLD}http://$address:$POS_PORT${RESET}
   Log in with your admin code to add cashiers.
+EOF
+  fi
+  cat <<EOF
 
   Container $CTID starts automatically when Proxmox boots.
   Open a shell in it with:  pct enter $CTID

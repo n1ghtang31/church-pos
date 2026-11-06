@@ -39,16 +39,72 @@ Requires Docker with the Compose plugin.
 
 The container restarts automatically unless you stop it. To update after a code change, run step 3 again. Sales data is kept.
 
-This serves plain HTTP, so only run it on a network you trust. If it will be reachable from the internet, put it behind an HTTPS reverse proxy and set `COOKIE_SECURE=true`.
+The app itself serves plain HTTP. To reach it from the internet, put it behind an HTTPS reverse proxy. See [Hosting publicly](#hosting-publicly).
 
 ## Cashiers
 
 Type the admin code on the login screen to add, edit, and remove cashiers. No one can ring up sales until at least one cashier exists. The admin code can also view reports, but sales must be rung up under a cashier's PIN.
 
-- PINs are 4 to 8 digits, and each cashier's PIN must be different.
+- PINs are 6 to 8 digits, and each cashier's PIN must be different. The admin code is 8 to 32 letters or digits.
 - PINs can't be viewed after they're saved. If one is forgotten, set a new one.
 - Removing a cashier logs them out right away. Their past sales stay in the reports and keep their name.
 - Changing `SECRET_KEY` makes every PIN stop working, so they'd all need to be set again.
+
+## Hosting publicly
+
+Only expose the app through an HTTPS reverse proxy such as nginx. Forward ports 80 and 443 on your router to nginx, never the app's port, and never the Proxmox web interface (8006).
+
+In `.env`, set:
+
+```
+COOKIE_SECURE=true
+TRUSTED_PROXY_IPS=<nginx's IP address>
+```
+
+Then restart with `docker compose up -d`. The Proxmox installer sets both when you say you're using a reverse proxy.
+
+With `COOKIE_SECURE=true`, logins only work through the HTTPS address. `TRUSTED_PROXY_IPS` lets the app see each visitor's real address, so 5 wrong codes lock out only that visitor for 5 minutes instead of locking out everyone who comes through nginx.
+
+Example nginx site, with the certificate from certbot (`certbot --nginx -d pos.example.com`):
+
+```nginx
+# At most 10 login attempts a minute from each address
+limit_req_zone $binary_remote_addr zone=pos_login:10m rate=10r/m;
+
+server {
+    listen 80;
+    server_name pos.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name pos.example.com;
+    # ssl_certificate lines are added by certbot
+
+    client_max_body_size 64k;
+
+    proxy_set_header Host $host;
+    # Replace, rather than append to, anything the visitor sent
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    location = /api/login {
+        limit_req zone=pos_login burst=5 nodelay;
+        proxy_pass http://<container-ip>:5000;
+    }
+
+    location / {
+        proxy_pass http://<container-ip>:5000;
+    }
+}
+```
+
+Nginx Proxy Manager also works: create a proxy host to `http://<container-ip>:5000` with a Let's Encrypt certificate, Force SSL, and HSTS turned on.
+
+To check that visitors' real addresses come through, enter a wrong code from a phone on mobile data, then run `docker compose logs web | grep "Failed login"` in `/opt/church-pos`. It should show the phone's address, not nginx's. If it shows nginx's address, set `TRUSTED_PROXY_IPS` to the address shown in the log, which is the address the app sees nginx connecting from.
+
+When the sale is over, remove the port forwarding or stop the container.
 
 ## Data and backups
 
@@ -95,7 +151,7 @@ Start the backend:
 
 ```bash
 pip install -r requirements.txt
-ADMIN_CODE=<your code> SECRET_KEY=dev python app.py
+ADMIN_CODE=<8+ character code> SECRET_KEY=dev python app.py
 ```
 
 In a second terminal, start the frontend:
