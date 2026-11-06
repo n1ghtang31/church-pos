@@ -7,6 +7,21 @@ A password-protected point of sale for church charity drives. Cashiers pick an i
 - Each cashier logs in with their own PIN, and sales record who rang them up
 - Daily multi-total and single-item reports
 
+## Installing on Proxmox
+
+In the Proxmox host's shell, as root, run:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/n1ghtang31/church-pos/self_hosted/proxmox/install.sh)"
+```
+
+It asks a few questions, then creates a Debian LXC container with Docker, starts Church POS, and prints the address to open. The container starts when Proxmox boots. Inside it (`pct enter <id>`), two commands are installed:
+
+- `church-pos-backup` copies the database and settings to `/opt/church-pos-backups`. It also runs nightly at 11:30 PM and keeps 30 days.
+- `church-pos-update` backs up, then installs the latest version. Sales data is kept.
+
+Those backups are on the same disk as the app, so also add the container to a Proxmox backup job (Datacenter > Backup).
+
 ## Running on a server (Docker)
 
 Requires Docker with the Compose plugin.
