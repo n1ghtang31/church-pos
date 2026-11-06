@@ -45,7 +45,7 @@ The app itself serves plain HTTP. To reach it from the internet, put it behind a
 
 Type the admin code on the login screen to add, edit, and remove cashiers. No one can ring up sales until at least one cashier exists. The admin code can also view reports, but sales must be rung up under a cashier's PIN.
 
-- PINs are 6 to 8 digits, and each cashier's PIN must be different. The admin code is 8 to 32 letters or digits.
+- PINs are 4 to 8 digits, and each cashier's PIN must be different. The admin code is 8 to 32 letters or digits.
 - PINs can't be viewed after they're saved. If one is forgotten, set a new one.
 - Removing a cashier logs them out right away. Their past sales stay in the reports and keep their name.
 - Changing `SECRET_KEY` makes every PIN stop working, so they'd all need to be set again.

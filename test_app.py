@@ -106,11 +106,16 @@ class CashierTests(PosTestCase):
         _, login = self.cashier_client("555555")
         self.assertEqual(login.json["role"], "cashier")
 
+    def test_four_digit_pin_allowed(self):
+        response = self.client.post("/api/cashiers", json={"name": "Sam", "pin": "4321"})
+        self.assertEqual(response.status_code, 201)
+        _, login = self.cashier_client("4321")
+        self.assertEqual(login.json["name"], "Sam")
+
     def test_invalid_cashiers_rejected(self):
         bad = [
             {"name": "", "pin": "555555"},
             {"name": "Sam", "pin": "123"},
-            {"name": "Sam", "pin": "12345"},
             {"name": "Sam", "pin": "12345678901"},
             {"name": "Sam", "pin": "abcd"},
             {"name": "Sam", "pin": 5555},

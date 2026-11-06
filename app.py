@@ -290,8 +290,8 @@ def clean_cashier_name(name):
     return name.strip()
 
 def clean_cashier_pin(pin):
-    if not isinstance(pin, str) or not re.fullmatch(r"[0-9]{6,8}", pin):
-        raise ValueError("PIN must be 6 to 8 digits")
+    if not isinstance(pin, str) or not re.fullmatch(r"[0-9]{4,8}", pin):
+        raise ValueError("PIN must be 4 to 8 digits")
     if hmac.compare_digest(pin.encode(), ADMIN_CODE.encode()):
         raise ValueError("That PIN is not available")
     return pin
