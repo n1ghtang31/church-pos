@@ -97,6 +97,15 @@ def init_db():
                 pin_hash TEXT NOT NULL UNIQUE
             )
         """)
+        # A refund is its own transaction with negative amounts, linked to the original sale.
+        # The unique index means a sale can only ever be refunded once.
+        columns = [row[1] for row in cursor.execute("PRAGMA table_info(transactions)")]
+        if "refund_of" not in columns:
+            cursor.execute("ALTER TABLE transactions ADD COLUMN refund_of INTEGER REFERENCES transactions(id)")
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_refund_of
+            ON transactions(refund_of) WHERE refund_of IS NOT NULL
+        """)
         conn.commit()
         conn.close()
         logger.info("Initialized SQLite DB at %s", DB_FILE)
@@ -404,12 +413,93 @@ def create_transaction():
         logger.exception("Error creating transaction")
         return jsonify({"error": "Internal server error while creating transaction"}), 500
 
+@app.route("/api/transactions/<int:transaction_id>/refund", methods=["POST"])
+def refund_transaction(transaction_id):
+    """Refund a whole sale by recording a negative transaction against it."""
+    try:
+        with closing(get_db_connection()) as conn:
+            original = conn.execute(
+                "SELECT * FROM transactions WHERE id = ?", (transaction_id,)
+            ).fetchone()
+            if not original:
+                return jsonify({"error": "Transaction not found"}), 404
+            if original["refund_of"] is not None:
+                return jsonify({"error": "A refund cannot be refunded"}), 400
+
+            timestamp = datetime.now().isoformat()
+            total = -original["total"]
+            try:
+                cursor = conn.execute(
+                    """INSERT INTO transactions (timestamp, tender, total, user, refund_of)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (timestamp, original["tender"], total, g.user["name"], transaction_id),
+                )
+            except sqlite3.IntegrityError:
+                return jsonify({"error": "This sale has already been refunded"}), 409
+            refund_id = cursor.lastrowid
+            conn.execute(
+                """INSERT INTO transaction_items
+                   (transaction_id, item_id, item_name, quantity, price)
+                   SELECT ?, item_id, item_name, -quantity, price
+                   FROM transaction_items WHERE transaction_id = ?""",
+                (refund_id, transaction_id),
+            )
+            conn.commit()
+
+        return jsonify(
+            {
+                "id": refund_id,
+                "timestamp": timestamp,
+                "tender": original["tender"],
+                "total": total,
+                "cashier": g.user["name"],
+                "refund_of": transaction_id,
+            }
+        ), 201
+    except Exception:
+        logger.exception("Error refunding transaction %s", transaction_id)
+        return jsonify({"error": "Internal server error while refunding transaction"}), 500
+
+def date_range_filter():
+    """Read optional start/end args. Returns (start, end, where_sql, params) for the alias t."""
+    try:
+        start = parse_report_date(request.args.get("start"))
+        end = parse_report_date(request.args.get("end"))
+    except ValueError:
+        raise ValueError("Dates must be in YYYY-MM-DD format") from None
+    if start and end and start > end:
+        raise ValueError("Start date must not be after end date")
+
+    # Timestamps are local ISO strings, so the first 10 characters are the date
+    where = []
+    params = []
+    if start:
+        where.append("substr(t.timestamp, 1, 10) >= ?")
+        params.append(start)
+    if end:
+        where.append("substr(t.timestamp, 1, 10) <= ?")
+        params.append(end)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    return start, end, where_sql, params
+
 @app.route("/api/transactions", methods=["GET"])
 def get_transactions():
     try:
+        _, _, where_sql, params = date_range_filter()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM transactions ORDER BY id")
+        cursor.execute(
+            f"""SELECT t.*, r.id AS refund_id, r.timestamp AS refund_timestamp, r.user AS refund_cashier
+                FROM transactions t
+                LEFT JOIN transactions r ON r.refund_of = t.id
+                {where_sql}
+                ORDER BY t.id""",
+            params,
+        )
         rows = cursor.fetchall()
         transactions = []
         for row in rows:
@@ -436,6 +526,10 @@ def get_transactions():
                     "tender": row["tender"],
                     "total": row["total"],
                     "cashier": row["user"],
+                    "refund_of": row["refund_of"],
+                    "refund_id": row["refund_id"],
+                    "refund_timestamp": row["refund_timestamp"],
+                    "refund_cashier": row["refund_cashier"],
                 }
             )
         conn.close()
@@ -455,7 +549,7 @@ def get_stats():
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT tender, total FROM transactions")
+        cursor.execute("SELECT tender, total, refund_of FROM transactions")
         rows = cursor.fetchall()
         conn.close()
 
@@ -464,7 +558,7 @@ def get_stats():
             if tender not in stats:
                 # Add unexpected tender types safely
                 stats[tender] = {"count": 0, "total": 0}
-            stats[tender]["count"] += 1
+            stats[tender]["count"] += -1 if row["refund_of"] else 1
             stats[tender]["total"] += row["total"]
 
         overall_total = sum(stats[t]["total"] for t in stats)
@@ -520,36 +614,30 @@ def parse_report_date(value):
 def get_report_summary():
     """Daily multi-totals and single-item totals, optionally limited to start..end (inclusive)."""
     try:
-        start = parse_report_date(request.args.get("start"))
-        end = parse_report_date(request.args.get("end"))
-    except ValueError:
-        return jsonify({"error": "Dates must be in YYYY-MM-DD format"}), 400
-    if start and end and start > end:
-        return jsonify({"error": "Start date must not be after end date"}), 400
+        start, end, where_sql, params = date_range_filter()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
     try:
-        # Timestamps are local ISO strings, so the first 10 characters are the sale date
-        where = []
-        params = []
-        if start:
-            where.append("substr(t.timestamp, 1, 10) >= ?")
-            params.append(start)
-        if end:
-            where.append("substr(t.timestamp, 1, 10) <= ?")
-            params.append(end)
-        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        # Refunds are negative transactions, so summed amounts and quantities are already
+        # net of them. Counts subtract a refund, and refunds are also reported separately.
+        net_count = "SUM(CASE WHEN t.refund_of IS NULL THEN 1 ELSE -1 END)"
+        refund_count = "SUM(CASE WHEN t.refund_of IS NULL THEN 0 ELSE 1 END)"
+        refund_total = "SUM(CASE WHEN t.refund_of IS NULL THEN 0 ELSE t.total END)"
 
         with closing(get_db_connection()) as conn:
             tender_rows = conn.execute(
                 f"""SELECT substr(t.timestamp, 1, 10) AS sale_date, t.tender,
-                           COUNT(*) AS count, SUM(t.total) AS total
+                           {net_count} AS count, SUM(t.total) AS total,
+                           {refund_count} AS refund_count, {refund_total} AS refund_total
                     FROM transactions t {where_sql}
                     GROUP BY sale_date, t.tender
                     ORDER BY sale_date""",
                 params,
             ).fetchall()
             cashier_rows = conn.execute(
-                f"""SELECT t.user AS cashier, COUNT(*) AS count, SUM(t.total) AS total
+                f"""SELECT t.user AS cashier, {net_count} AS count, SUM(t.total) AS total,
+                           {refund_total} AS refund_total
                     FROM transactions t {where_sql}
                     GROUP BY t.user
                     ORDER BY total DESC""",
@@ -569,23 +657,34 @@ def get_report_summary():
 
         by_tender = {tender: {"count": 0, "total": 0} for tender in VALID_TENDERS}
         by_day = {}
+        refunds = {"count": 0, "total": 0}
         for row in tender_rows:
+            refunds["count"] += row["refund_count"]
+            refunds["total"] += row["refund_total"]
             tender = by_tender.setdefault(row["tender"], {"count": 0, "total": 0})
             tender["count"] += row["count"]
             tender["total"] += row["total"]
 
             day = by_day.setdefault(
                 row["sale_date"],
-                {"date": row["sale_date"], "count": 0, "total": 0, "tenders": {t: 0 for t in VALID_TENDERS}},
+                {
+                    "date": row["sale_date"],
+                    "count": 0,
+                    "total": 0,
+                    "refunds": 0,
+                    "tenders": {t: 0 for t in VALID_TENDERS},
+                },
             )
             day["count"] += row["count"]
             day["total"] += row["total"]
+            day["refunds"] += row["refund_total"]
             day["tenders"][row["tender"]] = day["tenders"].get(row["tender"], 0) + row["total"]
 
         for tender in by_tender.values():
             tender["total"] = round(tender["total"], 2)
         for day in by_day.values():
             day["total"] = round(day["total"], 2)
+            day["refunds"] = round(day["refunds"], 2)
             day["tenders"] = {t: round(amount, 2) for t, amount in day["tenders"].items()}
 
         departments = {item["id"]: item["department"] for item in ITEMS}
@@ -619,9 +718,15 @@ def get_report_summary():
                     "total": round(sum(t["total"] for t in by_tender.values()), 2),
                 },
                 "by_tender": by_tender,
+                "refunds": {"count": refunds["count"], "total": round(refunds["total"], 2)},
                 "by_day": list(by_day.values()),
                 "by_cashier": [
-                    {"cashier": row["cashier"], "count": row["count"], "total": round(row["total"], 2)}
+                    {
+                        "cashier": row["cashier"],
+                        "count": row["count"],
+                        "refunds": round(row["refund_total"], 2),
+                        "total": round(row["total"], 2),
+                    }
                     for row in cashier_rows
                 ],
                 "by_department": sorted(by_department.values(), key=lambda d: -d["total"]),

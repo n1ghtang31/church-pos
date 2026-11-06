@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import "./App.css";
 import Cashiers from "./Cashiers";
+import Journal from "./Journal";
 import Login from "./Login";
 import Reports from "./Reports";
 
@@ -226,6 +227,12 @@ function App() {
           </button>
         )}
         <button
+          className={`tab-button ${view === "journal" ? "active" : ""}`}
+          onClick={() => setView("journal")}
+        >
+          Journal
+        </button>
+        <button
           className={`tab-button ${view === "reports" ? "active" : ""}`}
           onClick={() => setView("reports")}
         >
@@ -238,6 +245,8 @@ function App() {
       </nav>
 
       {view === "cashiers" && <Cashiers api={api} />}
+
+      {view === "journal" && <Journal api={api} />}
 
       {view === "reports" && <Reports api={api} />}
 

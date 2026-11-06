@@ -1,13 +1,5 @@
 import { useState, useEffect } from "react";
-
-const TENDERS = ["cash", "check", "venmo"];
-
-const money = (amount) => `$${amount.toFixed(2)}`;
-
-const capitalize = (text) => text.charAt(0).toUpperCase() + text.slice(1);
-
-// Today's date in the browser's timezone, as YYYY-MM-DD
-const today = () => new Date().toLocaleDateString("en-CA");
+import { TENDERS, capitalize, money, today } from "./format";
 
 function Reports({ api }) {
   const [start, setStart] = useState(today);
@@ -100,10 +92,17 @@ function Reports({ api }) {
           <p className="report-overall">
             {money(report.overall.total)} from {report.overall.count}{" "}
             {report.overall.count === 1 ? "sale" : "sales"}
+            {report.refunds.count > 0 &&
+              `, after ${report.refunds.count} ${
+                report.refunds.count === 1 ? "refund" : "refunds"
+              } (${money(report.refunds.total)})`}
           </p>
 
           <section className="report-section">
             <h3>Daily Multi-Total</h3>
+            <p className="report-note">
+              Sales, payment methods, and totals are all after refunds.
+            </p>
             <table className="report-table">
               <thead>
                 <tr>
@@ -114,6 +113,7 @@ function Reports({ api }) {
                       {capitalize(tender)}
                     </th>
                   ))}
+                  <th className="num">Refunds</th>
                   <th className="num">Total</th>
                 </tr>
               </thead>
@@ -127,12 +127,13 @@ function Reports({ api }) {
                         {money(day.tenders[tender])}
                       </td>
                     ))}
+                    <td className="num">{money(day.refunds)}</td>
                     <td className="num">{money(day.total)}</td>
                   </tr>
                 ))}
                 {report.by_day.length === 0 && (
                   <tr>
-                    <td colSpan={TENDERS.length + 3}>No sales in this period</td>
+                    <td colSpan={TENDERS.length + 4}>No sales in this period</td>
                   </tr>
                 )}
               </tbody>
@@ -145,6 +146,7 @@ function Reports({ api }) {
                       {money(report.by_tender[tender].total)}
                     </td>
                   ))}
+                  <td className="num">{money(report.refunds.total)}</td>
                   <td className="num">{money(report.overall.total)}</td>
                 </tr>
               </tfoot>
@@ -182,6 +184,7 @@ function Reports({ api }) {
                 <tr>
                   <th>Cashier</th>
                   <th className="num">Sales</th>
+                  <th className="num">Refunds</th>
                   <th className="num">Total</th>
                 </tr>
               </thead>
@@ -190,12 +193,13 @@ function Reports({ api }) {
                   <tr key={cashier.cashier}>
                     <td>{cashier.cashier}</td>
                     <td className="num">{cashier.count}</td>
+                    <td className="num">{money(cashier.refunds)}</td>
                     <td className="num">{money(cashier.total)}</td>
                   </tr>
                 ))}
                 {report.by_cashier.length === 0 && (
                   <tr>
-                    <td colSpan="3">No sales in this period</td>
+                    <td colSpan="4">No sales in this period</td>
                   </tr>
                 )}
               </tbody>

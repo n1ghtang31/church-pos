@@ -56,7 +56,15 @@ docker compose exec web python -c "import sqlite3; sqlite3.connect('/data/restor
 docker compose restart web
 ```
 
+## Journal
+
+The **Journal** tab shows a receipt for every transaction, newest first, so each cashier's sales can be audited. Filter by date or cashier. Each receipt has a **Print** button and, for sales, a **Refund** button.
+
+A refund covers the whole sale and can only be done once. It is saved as a separate negative receipt linked to the original, and it records who processed it. The original receipt stays and is marked as refunded.
+
 ## Reports
+
+Refunds appear as negative amounts and reduce sales counts, payment totals, and item quantities on the day the refund was made. On Cashier Totals, a refund counts against whoever processed it, not whoever made the sale. If a sale from an earlier day is refunded, the earlier day's totals don't change.
 
 Open the **Reports** tab after logging in. It shows today by default, and you can pick a date range or all dates, then print.
 
@@ -105,7 +113,8 @@ All endpoints except login, session, and health require a logged-in session.
 | `PUT`, `DELETE /api/cashiers/<id>` | Edit or remove a cashier (admin only) |
 | `GET /api/items` | Items available to ring up |
 | `POST /api/transactions` | Record a sale (cashier only) |
-| `GET /api/transactions` | All sales with their items |
+| `GET /api/transactions?start=YYYY-MM-DD&end=YYYY-MM-DD` | Sales and refunds with their items; both dates are optional |
+| `POST /api/transactions/<id>/refund` | Refund a whole sale |
 | `GET /api/reports/summary?start=YYYY-MM-DD&end=YYYY-MM-DD` | Report totals; both dates are optional |
 | `GET /api/stats` | All-time totals by payment method |
 | `GET /api/item-sales` | All-time totals by item |

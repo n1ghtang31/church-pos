@@ -252,12 +252,12 @@ class ReportTests(PosTestCase):
         self.assertEqual(
             report["by_cashier"],
             [
-                {"cashier": "Pat", "count": 3, "total": 33.4},
-                {"cashier": "Sam", "count": 1, "total": 7.25},
+                {"cashier": "Pat", "count": 3, "refunds": 0, "total": 33.4},
+                {"cashier": "Sam", "count": 1, "refunds": 0, "total": 7.25},
             ],
         )
         one_day = self.report(start="2026-11-01", end="2026-11-01")
-        self.assertEqual(one_day["by_cashier"], [{"cashier": "Pat", "count": 2, "total": 33.1}])
+        self.assertEqual(one_day["by_cashier"], [{"cashier": "Pat", "count": 2, "refunds": 0, "total": 33.1}])
         empty = self.report(start="2020-01-01", end="2020-01-01")
         self.assertEqual(empty["by_cashier"], [])
 
@@ -265,6 +265,135 @@ class ReportTests(PosTestCase):
         for params in [{"start": "nope"}, {"start": "2026-11-02", "end": "2026-11-01"}]:
             response = self.client.get("/api/reports/summary", query_string=params)
             self.assertEqual(response.status_code, 400)
+
+
+class RefundTests(PosTestCase):
+    def setUp(self):
+        super().setUp()
+        self.login()
+        self.sale = self.sell(
+            [{"id": 1, "price": 5, "quantity": 2}, {"id": 9, "price": 20}], "cash"
+        ).json
+        self.other_sale = self.sell([{"id": 1, "price": 3}], "venmo").json
+
+    def refund(self, transaction_id=None):
+        return self.client.post(f"/api/transactions/{transaction_id or self.sale['id']}/refund")
+
+    def report(self):
+        return self.client.get("/api/reports/summary").json
+
+    def test_refund_creates_linked_negative_transaction(self):
+        response = self.refund()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json["total"], -30)
+        self.assertEqual(response.json["refund_of"], self.sale["id"])
+
+        transactions = {t["id"]: t for t in self.client.get("/api/transactions").json}
+        original = transactions[self.sale["id"]]
+        refund = transactions[response.json["id"]]
+        self.assertEqual(original["total"], 30)
+        self.assertEqual(original["refund_id"], refund["id"])
+        self.assertEqual(original["refund_cashier"], "Pat")
+        self.assertEqual(refund["tender"], "cash")
+        self.assertEqual(refund["refund_of"], original["id"])
+        self.assertEqual(
+            [(i["name"], i["quantity"], i["price"]) for i in refund["items"]],
+            [("Nuts", -2, 5), ("Donation", -1, 20)],
+        )
+
+    def test_refund_reduces_every_report_total(self):
+        self.refund()
+        report = self.report()
+        self.assertEqual(report["overall"], {"count": 1, "total": 3})
+        self.assertEqual(report["refunds"], {"count": 1, "total": -30})
+        self.assertEqual(report["by_tender"]["cash"], {"count": 0, "total": 0})
+        self.assertEqual(report["by_tender"]["venmo"], {"count": 1, "total": 3})
+        self.assertEqual(report["by_day"][0]["refunds"], -30)
+        self.assertEqual(report["by_day"][0]["tenders"]["cash"], 0)
+        self.assertEqual(report["by_day"][0]["total"], 3)
+
+        items = {i["name"]: i for i in report["items"]}
+        self.assertEqual((items["Nuts"]["quantity"], items["Nuts"]["total"]), (1, 3))
+        self.assertEqual((items["Donation"]["quantity"], items["Donation"]["total"]), (0, 0))
+        departments = {d["department"]: d for d in report["by_department"]}
+        self.assertEqual((departments["Food"]["quantity"], departments["Food"]["total"]), (1, 3))
+        self.assertEqual((departments["Misc"]["quantity"], departments["Misc"]["total"]), (0, 0))
+        self.assertEqual(report["by_cashier"], [{"cashier": "Pat", "count": 1, "refunds": -30, "total": 3}])
+
+    def test_refund_counts_on_the_day_it_happened(self):
+        self.backdate(self.sale["id"], "2026-11-01")
+        refund = self.refund().json
+        self.backdate(refund["id"], "2026-11-02")
+
+        first = self.client.get("/api/reports/summary?start=2026-11-01&end=2026-11-01").json
+        self.assertEqual(first["overall"], {"count": 1, "total": 30})
+        self.assertEqual(first["refunds"], {"count": 0, "total": 0})
+
+        second = self.client.get("/api/reports/summary?start=2026-11-02&end=2026-11-02").json
+        self.assertEqual(second["refunds"], {"count": 1, "total": -30})
+        self.assertEqual(second["by_tender"]["cash"], {"count": -1, "total": -30})
+
+    def test_refund_shows_who_processed_it(self):
+        self.client.post("/api/logout")
+        self.login("9999")
+        response = self.refund()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json["cashier"], "Admin")
+        names = {c["cashier"]: c for c in self.report()["by_cashier"]}
+        self.assertEqual(names["Pat"]["total"], 33)
+        self.assertEqual(names["Admin"]["total"], -30)
+        self.assertEqual(names["Admin"]["count"], -1)
+
+    def test_cannot_refund_twice(self):
+        self.assertEqual(self.refund().status_code, 201)
+        self.assertEqual(self.refund().status_code, 409)
+        self.assertEqual(self.report()["refunds"]["count"], 1)
+
+    def test_cannot_refund_a_refund(self):
+        refund = self.refund().json
+        self.assertEqual(self.refund(refund["id"]).status_code, 400)
+
+    def test_refund_missing_transaction(self):
+        self.assertEqual(self.refund(99999).status_code, 404)
+
+    def test_refund_requires_login(self):
+        client = pos.app.test_client()
+        response = client.post(f"/api/transactions/{self.sale['id']}/refund")
+        self.assertEqual(response.status_code, 401)
+
+    def test_transactions_filtered_by_date(self):
+        self.backdate(self.sale["id"], "2026-11-01")
+        response = self.client.get("/api/transactions?start=2026-11-01&end=2026-11-01")
+        self.assertEqual([t["id"] for t in response.json], [self.sale["id"]])
+        bad = self.client.get("/api/transactions?start=nope")
+        self.assertEqual(bad.status_code, 400)
+
+    def test_existing_database_is_upgraded(self):
+        import sqlite3
+
+        path = os.path.join(_tmp.name, "old.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
+               tender TEXT NOT NULL, total REAL NOT NULL, user TEXT NOT NULL)"""
+        )
+        conn.execute(
+            "INSERT INTO transactions (timestamp, tender, total, user) VALUES ('2025-01-01T09:00:00', 'cash', 5, 'Old')"
+        )
+        conn.commit()
+        conn.close()
+
+        original = pos.DB_FILE
+        pos.DB_FILE = path
+        try:
+            pos.init_db()
+            pos.init_db()
+            conn = pos.get_db_connection()
+            row = conn.execute("SELECT total, refund_of FROM transactions").fetchone()
+            conn.close()
+        finally:
+            pos.DB_FILE = original
+        self.assertEqual((row["total"], row["refund_of"]), (5, None))
 
 
 if __name__ == "__main__":

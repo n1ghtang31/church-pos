@@ -351,7 +351,8 @@
   font-weight: 500;
 }
 
-.report-controls input {
+.report-controls input,
+.report-controls select {
   padding: 9px;
   font-size: 16px;
   border: 2px solid #ddd;
@@ -399,10 +400,117 @@
   border-top: 2px solid #333;
 }
 
+/* Journal */
+.journal-empty {
+  background: #f5f5f5;
+  padding: 20px;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.journal .login-error {
+  margin-bottom: 20px;
+}
+
+.receipts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 20px;
+  align-items: start;
+}
+
+.receipt {
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.receipt.refund {
+  border: 2px solid #c62828;
+}
+
+.receipt-title {
+  margin: 0 0 10px;
+  text-align: center;
+  font-size: 16px;
+}
+
+.receipt-banner {
+  margin-bottom: 10px;
+  padding: 6px;
+  background: #fdecea;
+  color: #b71c1c;
+  border-radius: 4px;
+  text-align: center;
+  font-weight: bold;
+}
+
+.receipt-details {
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px dashed #999;
+  font-size: 14px;
+}
+
+.receipt-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 15px;
+  margin-bottom: 4px;
+}
+
+.receipt-total {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed #999;
+  font-size: 18px;
+  font-weight: bold;
+}
+
+.receipt-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 15px;
+}
+
+.receipt-actions button {
+  flex: 1;
+}
+
+.report-note {
+  margin-top: 0;
+  font-size: 14px;
+  color: #666;
+}
+
 @media print {
   .app-nav,
-  .report-controls {
+  .report-controls,
+  .receipt-actions {
     display: none;
+  }
+
+  /* Print button: show only the chosen receipt */
+  .pos-container:has(.journal.printing-one) > h1,
+  .journal.printing-one .login-error,
+  .journal.printing-one .receipt:not(.printing) {
+    display: none;
+  }
+
+  .journal.printing-one .receipts {
+    display: block;
+  }
+
+  .journal.printing-one .receipt {
+    border: none;
+    max-width: 380px;
+    margin: 0 auto;
+  }
+
+  .receipt {
+    break-inside: avoid;
   }
 
   .report-section {
