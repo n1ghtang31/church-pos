@@ -7,9 +7,10 @@ import sqlite3
 import os
 import re
 import logging
-import threading
 import time
 from contextlib import closing
+
+import click
 from datetime import date, datetime, timedelta
 from flask import Flask, g, jsonify, request, send_from_directory, session
 
@@ -47,11 +48,14 @@ app.config.update(
 
 PUBLIC_API_PATHS = {"/api/login", "/api/session", "/api/health"}
 
-# Failed login tracking, kept per process (the container runs a single worker)
-MAX_LOGIN_FAILURES = 5
+# After this many wrong codes in a row from one address, a public address is banned
+# until the admin unblocks it. A private address only gets a short lockout, because it
+# may be the reverse proxy or a network everyone shares, and banning it would lock
+# out every cashier.
+MAX_LOGIN_FAILURES = 10
 LOGIN_LOCKOUT_SECONDS = 5 * 60
-login_failures = {}
-login_failures_lock = threading.Lock()
+# Wrong codes older than this are forgotten
+FAILURE_WINDOW_SECONDS = 24 * 60 * 60
 
 # Database file path (default to data dir for a container)
 DB_FILE = os.environ.get("DB_FILE", "church_pos.db")
@@ -113,6 +117,16 @@ def init_db():
         columns = [row[1] for row in cursor.execute("PRAGMA table_info(transactions)")]
         if "refund_of" not in columns:
             cursor.execute("ALTER TABLE transactions ADD COLUMN refund_of INTEGER REFERENCES transactions(id)")
+        # Kept in the database so bans survive a restart
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS login_failures (
+                ip TEXT PRIMARY KEY,
+                failures INTEGER NOT NULL,
+                last_failure REAL NOT NULL,
+                banned INTEGER NOT NULL DEFAULT 0,
+                locked_until REAL
+            )
+        """)
         cursor.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_refund_of
             ON transactions(refund_of) WHERE refund_of IS NOT NULL
@@ -155,26 +169,69 @@ def client_ip():
             return forwarded
     return remote
 
-def is_locked_out(ip):
-    with login_failures_lock:
-        failure = login_failures.get(ip)
-        if not failure:
-            return False
-        count, last_failure = failure
-        if time.monotonic() - last_failure >= LOGIN_LOCKOUT_SECONDS:
-            del login_failures[ip]
-            return False
-        return count >= MAX_LOGIN_FAILURES
+def can_be_banned(ip):
+    try:
+        return ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
 
-def record_login_failure(ip):
-    with login_failures_lock:
-        # Forget expired failures so many different addresses can't grow this forever
-        if len(login_failures) > 10000:
-            now = time.monotonic()
-            for key in [k for k, (_, last) in login_failures.items() if now - last >= LOGIN_LOCKOUT_SECONDS]:
-                del login_failures[key]
-        count, _ = login_failures.get(ip, (0, 0))
-        login_failures[ip] = (count + 1, time.monotonic())
+def login_block(conn, ip):
+    """Return "banned" or "locked" if ip may not log in right now, otherwise None."""
+    row = conn.execute(
+        "SELECT banned, locked_until FROM login_failures WHERE ip = ?", (ip,)
+    ).fetchone()
+    if not row:
+        return None
+    if row["banned"]:
+        return "banned"
+    if row["locked_until"] and row["locked_until"] > time.time():
+        return "locked"
+    return None
+
+def record_login_failure(conn, ip):
+    """Count a wrong code from ip. Returns "banned" or "locked" if this one blocked it."""
+    now = time.time()
+    conn.execute(
+        "DELETE FROM login_failures WHERE banned = 0 AND last_failure < ?",
+        (now - FAILURE_WINDOW_SECONDS,),
+    )
+    row = conn.execute(
+        "SELECT failures, locked_until FROM login_failures WHERE ip = ?", (ip,)
+    ).fetchone()
+    # Start counting again once an earlier lockout has expired
+    if row is None or (row["locked_until"] and row["locked_until"] <= now):
+        failures = 1
+    else:
+        failures = row["failures"] + 1
+
+    banned = 0
+    locked_until = None
+    result = None
+    if failures >= MAX_LOGIN_FAILURES:
+        if can_be_banned(ip):
+            banned = 1
+            result = "banned"
+        else:
+            locked_until = now + LOGIN_LOCKOUT_SECONDS
+            result = "locked"
+
+    conn.execute(
+        """INSERT INTO login_failures (ip, failures, last_failure, banned, locked_until)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(ip) DO UPDATE SET
+               failures = excluded.failures,
+               last_failure = excluded.last_failure,
+               banned = excluded.banned,
+               locked_until = excluded.locked_until""",
+        (ip, failures, now, banned, locked_until),
+    )
+    conn.commit()
+    return result
+
+BLOCK_MESSAGES = {
+    "banned": "Too many wrong codes. This device is blocked until the admin unblocks it.",
+    "locked": "Too many wrong codes. Try again in 5 minutes.",
+}
 
 def hash_pin(pin):
     # Keyed so PINs can be looked up directly but can't be guessed from a copy of the database.
@@ -220,7 +277,7 @@ def require_login():
     g.user = current_user()
     if not g.user:
         return jsonify({"error": "Authentication required"}), 401
-    if request.path.startswith("/api/cashiers") and g.user["role"] != "admin":
+    if request.path.startswith(("/api/cashiers", "/api/login-blocks")) and g.user["role"] != "admin":
         return jsonify({"error": "Admin access required"}), 403
     if request.path == "/api/transactions" and request.method == "POST" and g.user["role"] != "cashier":
         return jsonify({"error": "Log in as a cashier to record sales"}), 403
@@ -244,9 +301,11 @@ def get_session():
 @app.route("/api/login", methods=["POST"])
 def login():
     ip = client_ip()
-    if is_locked_out(ip):
-        logger.warning("Login blocked for %s after too many failed attempts", ip)
-        return jsonify({"error": "Too many attempts. Try again in 5 minutes."}), 429
+    with closing(get_db_connection()) as conn:
+        block = login_block(conn, ip)
+    if block:
+        logger.warning("Login refused for %s address %s", block, ip)
+        return jsonify({"error": BLOCK_MESSAGES[block]}), 403 if block == "banned" else 429
 
     data = request.get_json(silent=True)
     code = data.get("code") if isinstance(data, dict) else None
@@ -266,11 +325,17 @@ def login():
 
     if not role:
         logger.warning("Failed login from %s", ip)
-        record_login_failure(ip)
+        with closing(get_db_connection()) as conn:
+            block = record_login_failure(conn, ip)
+        if block:
+            logger.warning("%s %s after %d wrong codes", block.capitalize(), ip, MAX_LOGIN_FAILURES)
+            return jsonify({"error": BLOCK_MESSAGES[block]}), 403 if block == "banned" else 429
         return jsonify({"error": "Incorrect code"}), 401
 
-    with login_failures_lock:
-        login_failures.pop(ip, None)
+    # A correct code clears the count, so occasional typos never add up to a ban
+    with closing(get_db_connection()) as conn:
+        conn.execute("DELETE FROM login_failures WHERE ip = ?", (ip,))
+        conn.commit()
     session.clear()
     session.permanent = True
     session["role"] = role
@@ -283,6 +348,73 @@ def login():
 def logout():
     session.clear()
     return jsonify({"authenticated": False})
+
+def local_time(seconds):
+    return datetime.fromtimestamp(seconds).isoformat(timespec="seconds") if seconds else None
+
+@app.route("/api/login-blocks", methods=["GET"])
+def get_login_blocks():
+    with closing(get_db_connection()) as conn:
+        rows = conn.execute(
+            """SELECT * FROM login_failures
+               WHERE banned = 1 OR locked_until > ?
+               ORDER BY last_failure DESC""",
+            (time.time(),),
+        ).fetchall()
+    return jsonify(
+        [
+            {
+                "ip": row["ip"],
+                "failures": row["failures"],
+                "last_failure": local_time(row["last_failure"]),
+                "banned": bool(row["banned"]),
+                "locked_until": local_time(row["locked_until"]),
+            }
+            for row in rows
+        ]
+    )
+
+@app.route("/api/login-blocks/<ip>", methods=["DELETE"])
+def delete_login_block(ip):
+    with closing(get_db_connection()) as conn:
+        cursor = conn.execute("DELETE FROM login_failures WHERE ip = ?", (ip,))
+        conn.commit()
+    if cursor.rowcount == 0:
+        return jsonify({"error": "That address is not blocked"}), 404
+    logger.warning("Admin unblocked %s", ip)
+    return "", 204
+
+# Run in the container if the admin's own device is blocked:
+#   docker compose exec web flask --app app bans
+#   docker compose exec web flask --app app unban <ip>
+@app.cli.command("bans")
+def list_bans_command():
+    """List blocked addresses."""
+    with closing(get_db_connection()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM login_failures WHERE banned = 1 OR locked_until > ? ORDER BY last_failure DESC",
+            (time.time(),),
+        ).fetchall()
+    if not rows:
+        click.echo("No addresses are blocked.")
+    for row in rows:
+        status = "banned" if row["banned"] else f"locked until {local_time(row['locked_until'])}"
+        click.echo(f"{row['ip']}  {status}, {row['failures']} wrong codes, last {local_time(row['last_failure'])}")
+
+@app.cli.command("unban")
+@click.argument("ip", required=False)
+@click.option("--all", "unban_all", is_flag=True, help="Unblock every address.")
+def unban_command(ip, unban_all):
+    """Unblock an address, or every address with --all."""
+    if not ip and not unban_all:
+        raise click.UsageError("Give an address to unblock, or --all.")
+    with closing(get_db_connection()) as conn:
+        if unban_all:
+            cursor = conn.execute("DELETE FROM login_failures")
+        else:
+            cursor = conn.execute("DELETE FROM login_failures WHERE ip = ?", (ip,))
+        conn.commit()
+    click.echo(f"Unblocked {cursor.rowcount} address(es).")
 
 def clean_cashier_name(name):
     if not isinstance(name, str) or not name.strip() or len(name.strip()) > 50:

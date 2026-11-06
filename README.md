@@ -47,6 +47,8 @@ Type the admin code on the login screen to add, edit, and remove cashiers. No on
 
 - PINs are 4 to 8 digits, and each cashier's PIN must be different. The admin code is 8 to 32 letters or digits.
 - PINs can't be viewed after they're saved. If one is forgotten, set a new one.
+- After 10 wrong codes in a row from one device, it's blocked from logging in. A correct code resets the count, and wrong codes older than a day are forgotten. Unblock devices under **Blocked Devices** on the Cashiers page. If your own device is blocked, see [Unblocking from the server](#unblocking-from-the-server).
+- Devices on a private network address (such as `192.168.x.x`) are only locked out for 5 minutes instead, because that address might be shared by everyone or be the reverse proxy itself.
 - Removing a cashier logs them out right away. Their past sales stay in the reports and keep their name.
 - Changing `SECRET_KEY` makes every PIN stop working, so they'd all need to be set again.
 
@@ -63,7 +65,7 @@ TRUSTED_PROXY_IPS=<nginx's IP address>
 
 Then restart with `docker compose up -d`. The Proxmox installer sets both when you say you're using a reverse proxy.
 
-With `COOKIE_SECURE=true`, logins only work through the HTTPS address. `TRUSTED_PROXY_IPS` lets the app see each visitor's real address, so 5 wrong codes lock out only that visitor for 5 minutes instead of locking out everyone who comes through nginx.
+With `COOKIE_SECURE=true`, logins only work through the HTTPS address. `TRUSTED_PROXY_IPS` lets the app see each visitor's real address, so wrong codes block only that visitor instead of everyone who comes through nginx.
 
 Example nginx site, with the certificate from certbot (`certbot --nginx -d pos.example.com`):
 
@@ -105,6 +107,19 @@ Nginx Proxy Manager also works: create a proxy host to `http://<container-ip>:50
 To check that visitors' real addresses come through, enter a wrong code from a phone on mobile data, then run `docker compose logs web | grep "Failed login"` in `/opt/church-pos`. It should show the phone's address, not nginx's. If it shows nginx's address, set `TRUSTED_PROXY_IPS` to the address shown in the log, which is the address the app sees nginx connecting from.
 
 When the sale is over, remove the port forwarding or stop the container.
+
+### Unblocking from the server
+
+If the admin's own device is blocked, unblock it from the container (`pct enter <id>`):
+
+```bash
+cd /opt/church-pos
+docker compose exec web flask --app app bans              # list blocked addresses
+docker compose exec web flask --app app unban <address>   # unblock one
+docker compose exec web flask --app app unban --all       # unblock everyone
+```
+
+Containers set up with the Proxmox installer also have `church-pos-unban`, which runs the same commands: `church-pos-unban` lists, and `church-pos-unban <address>` or `church-pos-unban --all` unblocks.
 
 ## Data and backups
 
@@ -180,6 +195,8 @@ All endpoints except login, session, and health require a logged-in session.
 | `POST /api/logout` | Log out |
 | `GET /api/session` | Whether this browser is logged in |
 | `GET /api/health` | Health check used by Docker |
+| `GET /api/login-blocks` | Blocked addresses (admin only) |
+| `DELETE /api/login-blocks/<address>` | Unblock an address (admin only) |
 | `GET`, `POST /api/cashiers` | List or add cashiers (admin only) |
 | `PUT`, `DELETE /api/cashiers/<id>` | Edit or remove a cashier (admin only) |
 | `GET /api/items` | Items available to ring up |

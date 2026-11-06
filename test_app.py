@@ -12,8 +12,8 @@ import app as pos
 
 class PosTestCase(unittest.TestCase):
     def setUp(self):
-        pos.login_failures.clear()
         conn = pos.get_db_connection()
+        conn.execute("DELETE FROM login_failures")
         conn.execute("DELETE FROM transaction_items")
         conn.execute("DELETE FROM transactions")
         conn.execute("DELETE FROM cashiers")
@@ -62,11 +62,17 @@ class AuthTests(PosTestCase):
         self.client.post("/api/logout")
         self.assertEqual(self.client.get("/api/items").status_code, 401)
 
-    def test_lockout_after_repeated_failures(self):
+    def test_private_address_locked_out_for_a_while(self):
         for _ in range(pos.MAX_LOGIN_FAILURES):
             self.client.post("/api/login", json={"code": "0000"})
         response = self.client.post("/api/login", json={"code": "123456"})
         self.assertEqual(response.status_code, 429)
+
+        conn = pos.get_db_connection()
+        conn.execute("UPDATE login_failures SET locked_until = 0")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.client.post("/api/login", json={"code": "123456"}).status_code, 200)
 
 
 class CashierTests(PosTestCase):
@@ -159,6 +165,99 @@ class CashierTests(PosTestCase):
         self.assertEqual(sales[0]["cashier"], "Pat")
 
 
+class BanTests(PosTestCase):
+    VISITOR = "1.1.1.1"
+
+    def attempt(self, code, ip=VISITOR, client=None):
+        client = client or self.client
+        return client.post("/api/login", json={"code": code}, environ_base={"REMOTE_ADDR": ip})
+
+    def fail(self, times, ip=VISITOR):
+        return [self.attempt("000000", ip).status_code for _ in range(times)]
+
+    def admin(self):
+        client = pos.app.test_client()
+        client.post("/api/login", json={"code": "99990000"})
+        return client
+
+    def test_public_address_banned_after_ten_wrong_codes(self):
+        codes = self.fail(pos.MAX_LOGIN_FAILURES)
+        self.assertEqual(codes[:-1], [401] * (pos.MAX_LOGIN_FAILURES - 1))
+        self.assertEqual(codes[-1], 403)
+        response = self.attempt("123456")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("blocked", response.json["error"])
+
+    def test_ban_does_not_expire(self):
+        self.fail(pos.MAX_LOGIN_FAILURES)
+        conn = pos.get_db_connection()
+        conn.execute("UPDATE login_failures SET last_failure = 0")
+        conn.commit()
+        conn.close()
+        self.fail(1, ip="2.2.2.2")
+        self.assertEqual(self.attempt("123456").status_code, 403)
+
+    def test_other_visitors_unaffected(self):
+        self.fail(pos.MAX_LOGIN_FAILURES)
+        self.assertEqual(self.attempt("123456", ip="2.2.2.2").status_code, 200)
+
+    def test_correct_code_resets_count(self):
+        self.fail(pos.MAX_LOGIN_FAILURES - 1)
+        self.assertEqual(self.attempt("123456").status_code, 200)
+        self.assertEqual(self.fail(pos.MAX_LOGIN_FAILURES - 1)[-1], 401)
+
+    def test_old_wrong_codes_forgotten(self):
+        self.fail(pos.MAX_LOGIN_FAILURES - 1)
+        conn = pos.get_db_connection()
+        conn.execute("UPDATE login_failures SET last_failure = 0")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.fail(pos.MAX_LOGIN_FAILURES - 1)[-1], 401)
+
+    def test_admin_lists_and_unblocks(self):
+        self.fail(pos.MAX_LOGIN_FAILURES)
+        admin = self.admin()
+        blocks = admin.get("/api/login-blocks").json
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["ip"], self.VISITOR)
+        self.assertTrue(blocks[0]["banned"])
+        self.assertEqual(blocks[0]["failures"], pos.MAX_LOGIN_FAILURES)
+
+        self.assertEqual(admin.delete(f"/api/login-blocks/{self.VISITOR}").status_code, 204)
+        self.assertEqual(admin.get("/api/login-blocks").json, [])
+        self.assertEqual(self.attempt("123456").status_code, 200)
+        self.assertEqual(admin.delete(f"/api/login-blocks/{self.VISITOR}").status_code, 404)
+
+    def test_ipv6_address_unblocks(self):
+        ip = "2606:4700:4700::1111"
+        self.fail(pos.MAX_LOGIN_FAILURES, ip=ip)
+        admin = self.admin()
+        self.assertEqual(admin.delete("/api/login-blocks/2606:4700:4700::1111").status_code, 204)
+        self.assertEqual(self.attempt("123456", ip=ip).status_code, 200)
+
+    def test_cashiers_cannot_see_or_unblock(self):
+        self.fail(pos.MAX_LOGIN_FAILURES)
+        cashier = pos.app.test_client()
+        cashier.post("/api/login", json={"code": "123456"})
+        self.assertEqual(cashier.get("/api/login-blocks").status_code, 403)
+        self.assertEqual(cashier.delete(f"/api/login-blocks/{self.VISITOR}").status_code, 403)
+        self.assertEqual(pos.app.test_client().get("/api/login-blocks").status_code, 401)
+
+    def test_command_line_unban(self):
+        self.fail(pos.MAX_LOGIN_FAILURES)
+        self.fail(pos.MAX_LOGIN_FAILURES, ip="2.2.2.2")
+        runner = pos.app.test_cli_runner()
+        listing = runner.invoke(args=["bans"]).output
+        self.assertIn(self.VISITOR, listing)
+        self.assertIn("2.2.2.2", listing)
+
+        self.assertIn("Unblocked 1", runner.invoke(args=["unban", self.VISITOR]).output)
+        self.assertEqual(self.attempt("123456").status_code, 200)
+        self.assertNotEqual(runner.invoke(args=["unban"]).exit_code, 0)
+        self.assertIn("Unblocked 1", runner.invoke(args=["unban", "--all"]).output)
+        self.assertIn("No addresses are blocked", runner.invoke(args=["bans"]).output)
+
+
 class SecurityTests(PosTestCase):
     def tearDown(self):
         pos.TRUSTED_PROXY_IPS = []
@@ -180,18 +279,27 @@ class SecurityTests(PosTestCase):
     def test_trusted_proxy_locks_out_only_the_visitor(self):
         pos.TRUSTED_PROXY_IPS = [pos.ipaddress.ip_network("10.0.0.5/32")]
         self.lock_out("10.0.0.5", forwarded="1.1.1.1")
-        self.assertEqual(self.fail_login("10.0.0.5", forwarded="1.1.1.1").status_code, 429)
+        self.assertEqual(self.fail_login("10.0.0.5", forwarded="1.1.1.1").status_code, 403)
         self.assertEqual(self.fail_login("10.0.0.5", forwarded="2.2.2.2").status_code, 401)
 
     def test_trusted_proxy_uses_the_entry_it_added(self):
         pos.TRUSTED_PROXY_IPS = [pos.ipaddress.ip_network("10.0.0.0/24")]
         self.lock_out("10.0.0.5", forwarded="9.9.9.9, 1.1.1.1")
-        self.assertEqual(self.fail_login("10.0.0.5", forwarded="8.8.8.8, 1.1.1.1").status_code, 429)
+        self.assertEqual(self.fail_login("10.0.0.5", forwarded="8.8.8.8, 1.1.1.1").status_code, 403)
 
     def test_untrusted_sender_cannot_fake_forwarded_header(self):
         pos.TRUSTED_PROXY_IPS = [pos.ipaddress.ip_network("10.0.0.5/32")]
         self.lock_out("10.0.0.9", forwarded="1.1.1.1")
         self.assertEqual(self.fail_login("10.0.0.9", forwarded="2.2.2.2").status_code, 429)
+
+    def test_proxy_address_never_banned(self):
+        # If the proxy's own address shows up, it only gets a short lockout
+        self.lock_out("10.0.0.5")
+        self.assertEqual(self.fail_login("10.0.0.5").status_code, 429)
+        conn = pos.get_db_connection()
+        banned = conn.execute("SELECT banned FROM login_failures WHERE ip = '10.0.0.5'").fetchone()[0]
+        conn.close()
+        self.assertEqual(banned, 0)
 
     def test_security_headers(self):
         response = self.client.get("/api/health")

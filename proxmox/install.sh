@@ -174,9 +174,10 @@ EOF
 }
 
 install_helpers() {
-  local backup update cron
+  local backup update unban cron
   backup=$(mktemp)
   update=$(mktemp)
+  unban=$(mktemp)
   cron=$(mktemp)
 
   cat >"$backup" <<EOF
@@ -207,6 +208,18 @@ docker image prune -f
 echo "Church POS is updated"
 EOF
 
+  cat >"$unban" <<EOF
+#!/usr/bin/env bash
+# Lists blocked addresses, or unblocks one: church-pos-unban <address>, or --all for every address.
+set -euo pipefail
+cd $APP_DIR
+if [[ \$# -eq 0 ]]; then
+  docker compose exec -T web flask --app app bans
+else
+  docker compose exec -T web flask --app app unban "\$@"
+fi
+EOF
+
   cat >"$cron" <<EOF
 # Nightly Church POS backup
 30 23 * * * root /usr/local/bin/church-pos-backup >>/var/log/church-pos-backup.log 2>&1
@@ -215,9 +228,10 @@ EOF
   local status=0
   pct push "$CTID" "$backup" /usr/local/bin/church-pos-backup --perms 755 &&
     pct push "$CTID" "$update" /usr/local/bin/church-pos-update --perms 755 &&
+    pct push "$CTID" "$unban" /usr/local/bin/church-pos-unban --perms 755 &&
     pct push "$CTID" "$cron" /etc/cron.d/church-pos-backup --perms 644 ||
     status=1
-  rm -f "$backup" "$update" "$cron"
+  rm -f "$backup" "$update" "$unban" "$cron"
   return "$status"
 }
 
@@ -381,6 +395,7 @@ EOF
   Inside the container:
     church-pos-backup    back up now (also runs nightly at 11:30 PM)
     church-pos-update    back up, then install the latest version
+    church-pos-unban     list blocked devices, or unblock one
 
   Backups are kept in $BACKUP_DIR for 30 days, along with a copy
   of the settings file. They live on the same disk as the app, so also set
