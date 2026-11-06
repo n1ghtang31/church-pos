@@ -344,6 +344,8 @@ main() {
   step "Building and starting Church POS (this takes a few minutes)" in_ct "cd $APP_DIR && docker compose up -d --build"
   wait_for "Waiting for Church POS to respond" "curl -fsS http://localhost:$POS_PORT/api/health" 45
   step "Installing nightly backups and the update command" install_helpers
+  # The shell from pct enter leaves /usr/local/bin out of PATH
+  step "Adding the commands to root's PATH" in_ct "grep -qs '/usr/local/bin' /root/.bashrc || echo 'export PATH=\"/usr/local/sbin:/usr/local/bin:\$PATH\"' >> /root/.bashrc"
 
   local address
   if [[ $IP_ADDRESS == dhcp ]]; then
