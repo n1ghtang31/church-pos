@@ -40,5 +40,6 @@ EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health', timeout=4)"
 
-# One worker keeps SQLite writes and the login lockout in a single process
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app", "--workers", "1", "--threads", "4", "--access-logfile", "-"]
+# One worker keeps SQLite writes and the login lockout in a single process.
+# The control socket isn't used, and the app user has no home folder for it.
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app", "--workers", "1", "--threads", "4", "--access-logfile", "-", "--no-control-socket"]
