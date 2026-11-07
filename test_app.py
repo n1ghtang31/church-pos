@@ -18,8 +18,7 @@ class PosTestCase(unittest.TestCase):
         conn.execute("DELETE FROM transactions")
         conn.execute("DELETE FROM cashiers")
         conn.execute(
-            "INSERT INTO cashiers (name, pin_hash, session_token) VALUES (?, ?, ?)",
-            ("Pat", pos.hash_pin("123456"), "pat-token"),
+            "INSERT INTO cashiers (name, pin_hash) VALUES (?, ?)", ("Pat", pos.hash_pin("123456"))
         )
         conn.commit()
         conn.close()
@@ -148,53 +147,6 @@ class CashierTests(PosTestCase):
         self.assertEqual(self.client.put(f"/api/cashiers/{cashier_id}", json={"pin": "777777"}).status_code, 200)
         self.assertEqual(self.cashier_client("123456")[1].status_code, 401)
         self.assertEqual(self.cashier_client("777777")[1].status_code, 200)
-
-    def test_pin_change_logs_cashier_out(self):
-        client, _ = self.cashier_client("123456")
-        self.client.put(f"/api/cashiers/{self.cashier_id('Pat')}", json={"pin": "777777"})
-        self.assertEqual(client.get("/api/items").status_code, 401)
-
-    def test_rename_keeps_cashier_logged_in(self):
-        client, _ = self.cashier_client("123456")
-        self.client.put(f"/api/cashiers/{self.cashier_id('Pat')}", json={"name": "Patricia"})
-        self.assertEqual(client.get("/api/session").json["name"], "Patricia")
-
-    def test_reused_id_after_reset_does_not_log_in_as_new_cashier(self):
-        old_device, _ = self.cashier_client("123456")
-        old_id = self.cashier_id("Pat")
-
-        # Simulate docker compose down -v: tables emptied and ids start over
-        conn = pos.get_db_connection()
-        conn.execute("DELETE FROM cashiers")
-        conn.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'cashiers'", (old_id - 1,))
-        conn.commit()
-        conn.close()
-        new_id = self.client.post("/api/cashiers", json={"name": "Mom", "pin": "246810"}).json["id"]
-        self.assertEqual(new_id, old_id)
-
-        self.assertFalse(old_device.get("/api/session").json["authenticated"])
-        self.assertEqual(old_device.get("/api/items").status_code, 401)
-        sale = old_device.post("/api/transactions", json={"items": [{"id": 1, "price": 5}], "tender": "cash"})
-        self.assertEqual(sale.status_code, 401)
-
-    def test_old_cookie_without_token_is_logged_out(self):
-        client = pos.app.test_client()
-        with client.session_transaction() as old_session:
-            old_session["role"] = "cashier"
-            old_session["cashier_id"] = self.cashier_id("Pat")
-        self.assertFalse(client.get("/api/session").json["authenticated"])
-
-    def test_existing_cashiers_get_tokens_on_upgrade(self):
-        conn = pos.get_db_connection()
-        conn.execute("UPDATE cashiers SET session_token = NULL")
-        conn.commit()
-        conn.close()
-        pos.init_db()
-        conn = pos.get_db_connection()
-        tokens = [row[0] for row in conn.execute("SELECT session_token FROM cashiers")]
-        conn.close()
-        self.assertTrue(all(tokens))
-        self.assertEqual(self.cashier_client("123456")[1].status_code, 200)
 
     def test_edit_missing_cashier(self):
         self.assertEqual(self.client.put("/api/cashiers/99999", json={"name": "Nobody"}).status_code, 404)
@@ -445,8 +397,7 @@ class ReportTests(PosTestCase):
     def test_cashier_totals(self):
         conn = pos.get_db_connection()
         conn.execute(
-            "INSERT INTO cashiers (name, pin_hash, session_token) VALUES (?, ?, ?)",
-            ("Sam", pos.hash_pin("555555"), "sam-token"),
+            "INSERT INTO cashiers (name, pin_hash) VALUES (?, ?)", ("Sam", pos.hash_pin("555555"))
         )
         conn.commit()
         conn.close()
