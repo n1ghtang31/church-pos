@@ -7,6 +7,7 @@ import sqlite3
 import os
 import re
 import logging
+import secrets
 import time
 from contextlib import closing
 
@@ -112,6 +113,15 @@ def init_db():
                 pin_hash TEXT NOT NULL UNIQUE
             )
         """)
+        # Each cashier's login cookie must carry this random token, so a cookie stops working
+        # when the PIN changes or the database is reset and the cashier's id is reused
+        cashier_columns = [row[1] for row in cursor.execute("PRAGMA table_info(cashiers)")]
+        if "session_token" not in cashier_columns:
+            cursor.execute("ALTER TABLE cashiers ADD COLUMN session_token TEXT")
+        for (cashier_id,) in cursor.execute("SELECT id FROM cashiers WHERE session_token IS NULL").fetchall():
+            cursor.execute(
+                "UPDATE cashiers SET session_token = ? WHERE id = ?", (secrets.token_hex(16), cashier_id)
+            )
         # A refund is its own transaction with negative amounts, linked to the original sale.
         # The unique index means a sale can only ever be refunded once.
         columns = [row[1] for row in cursor.execute("PRAGMA table_info(transactions)")]
@@ -246,10 +256,11 @@ def current_user():
     if role == "cashier":
         with closing(get_db_connection()) as conn:
             cashier = conn.execute(
-                "SELECT name FROM cashiers WHERE id = ?", (session.get("cashier_id"),)
+                "SELECT name, session_token FROM cashiers WHERE id = ?", (session.get("cashier_id"),)
             ).fetchone()
-        # A removed cashier is logged out on their next request
-        if cashier:
+        # A removed cashier, or one whose PIN changed, is logged out on their next request
+        token = session.get("cashier_token")
+        if cashier and isinstance(token, str) and hmac.compare_digest(token, cashier["session_token"]):
             return {"role": "cashier", "name": cashier["name"]}
         session.clear()
     return None
@@ -318,7 +329,7 @@ def login():
         else:
             with closing(get_db_connection()) as conn:
                 cashier = conn.execute(
-                    "SELECT id FROM cashiers WHERE pin_hash = ?", (hash_pin(code),)
+                    "SELECT id, session_token FROM cashiers WHERE pin_hash = ?", (hash_pin(code),)
                 ).fetchone()
             if cashier:
                 role = "cashier"
@@ -341,6 +352,7 @@ def login():
     session["role"] = role
     if cashier:
         session["cashier_id"] = cashier["id"]
+        session["cashier_token"] = cashier["session_token"]
     user = current_user()
     return jsonify({"authenticated": True, **user})
 
@@ -453,7 +465,8 @@ def create_cashier():
     try:
         with closing(get_db_connection()) as conn:
             cursor = conn.execute(
-                "INSERT INTO cashiers (name, pin_hash) VALUES (?, ?)", (name, hash_pin(pin))
+                "INSERT INTO cashiers (name, pin_hash, session_token) VALUES (?, ?, ?)",
+                (name, hash_pin(pin), secrets.token_hex(16)),
             )
             conn.commit()
     except sqlite3.IntegrityError as e:
@@ -473,6 +486,8 @@ def update_cashier(cashier_id):
             updates["name"] = clean_cashier_name(data["name"])
         if "pin" in data:
             updates["pin_hash"] = hash_pin(clean_cashier_pin(data["pin"]))
+            # Log out anyone still using the old PIN
+            updates["session_token"] = secrets.token_hex(16)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     if not updates:
