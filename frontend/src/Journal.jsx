@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { capitalize, money, today } from "./format";
+import { REFRESH_SECONDS, useAutoRefresh } from "./useAutoRefresh";
 
 const dateTime = (timestamp) => new Date(timestamp).toLocaleString();
 
@@ -86,6 +87,9 @@ function Journal({ api }) {
   const [reloadCount, setReloadCount] = useState(0);
   const [refundingId, setRefundingId] = useState(null);
   const [printingId, setPrintingId] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  // Hold still while a receipt is printing or a refund is being made
+  const refreshTick = useAutoRefresh(printingId !== null || refundingId !== null);
 
   useEffect(() => {
     let ignore = false;
@@ -100,6 +104,7 @@ function Journal({ api }) {
         if (response.ok) {
           setTransactions(result);
           setError("");
+          setLastUpdated(new Date());
         } else {
           setTransactions([]);
           setError(result.error || "Could not load the journal");
@@ -107,8 +112,8 @@ function Journal({ api }) {
       })
       .catch((error) => {
         console.error("Error:", error);
+        // Keep showing the last receipts if a refresh can't reach the server
         if (!ignore) {
-          setTransactions([]);
           setError("Error connecting to server");
         }
       });
@@ -118,7 +123,7 @@ function Journal({ api }) {
     };
     // api is recreated on every render, so it must not retrigger the request
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [start, end, reloadCount]);
+  }, [start, end, reloadCount, refreshTick]);
 
   // Print once the chosen receipt has been marked as the only one to show
   useEffect(() => {
@@ -219,6 +224,13 @@ function Journal({ api }) {
       </div>
 
       {error && <div className="login-error">{error}</div>}
+
+      {lastUpdated && (
+        <p className="report-note refresh-note">
+          Updates every {REFRESH_SECONDS} seconds. Last updated{" "}
+          {lastUpdated.toLocaleTimeString()}.
+        </p>
+      )}
 
       {shown.length === 0 && !error && (
         <p className="journal-empty">No transactions in this period</p>

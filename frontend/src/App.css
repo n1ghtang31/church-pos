@@ -488,7 +488,8 @@
 @media print {
   .app-nav,
   .report-controls,
-  .receipt-actions {
+  .receipt-actions,
+  .refresh-note {
     display: none;
   }
 

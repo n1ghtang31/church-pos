@@ -1,11 +1,14 @@
 import { useState, useEffect } from "react";
 import { TENDERS, capitalize, money, today } from "./format";
+import { REFRESH_SECONDS, useAutoRefresh } from "./useAutoRefresh";
 
 function Reports({ api }) {
   const [start, setStart] = useState(today);
   const [end, setEnd] = useState(today);
   const [report, setReport] = useState(null);
   const [error, setError] = useState("");
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const refreshTick = useAutoRefresh(false);
 
   useEffect(() => {
     let ignore = false;
@@ -20,6 +23,7 @@ function Reports({ api }) {
         if (response.ok) {
           setReport(result);
           setError("");
+          setLastUpdated(new Date());
         } else {
           setReport(null);
           setError(result.error || "Could not load report");
@@ -27,8 +31,8 @@ function Reports({ api }) {
       })
       .catch((error) => {
         console.error("Error:", error);
+        // Keep showing the last report if a refresh can't reach the server
         if (!ignore) {
-          setReport(null);
           setError("Error connecting to server");
         }
       });
@@ -38,7 +42,7 @@ function Reports({ api }) {
     };
     // api is recreated on every render, so it must not retrigger the request
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [start, end]);
+  }, [start, end, refreshTick]);
 
   const showRange = (newStart, newEnd) => {
     setStart(newStart);
@@ -85,6 +89,13 @@ function Reports({ api }) {
       </div>
 
       {error && <div className="login-error">{error}</div>}
+
+      {lastUpdated && (
+        <p className="report-note refresh-note">
+          Updates every {REFRESH_SECONDS} seconds. Last updated{" "}
+          {lastUpdated.toLocaleTimeString()}.
+        </p>
+      )}
 
       {report && (
         <>
