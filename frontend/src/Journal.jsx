@@ -1,10 +1,10 @@
 import { useState, useEffect } from "react";
-import { capitalize, money, today } from "./format";
+import { money, today } from "./format";
 import { REFRESH_SECONDS, useAutoRefresh } from "./useAutoRefresh";
 
 const dateTime = (timestamp) => new Date(timestamp).toLocaleString();
 
-function Receipt({ transaction, printing, refunding, onPrint, onRefund }) {
+function Receipt({ title, transaction, printing, refunding, onPrint, onRefund }) {
   const isRefund = transaction.refund_of !== null;
   const isRefunded = transaction.refund_id !== null;
 
@@ -12,7 +12,7 @@ function Receipt({ transaction, printing, refunding, onPrint, onRefund }) {
     <article
       className={`receipt ${isRefund ? "refund" : ""} ${printing ? "printing" : ""}`}
     >
-      <h3 className="receipt-title">Church Charity Drive</h3>
+      <h3 className="receipt-title">{title}</h3>
 
       {isRefund && (
         <div className="receipt-banner">
@@ -23,7 +23,7 @@ function Receipt({ transaction, printing, refunding, onPrint, onRefund }) {
         <div className="receipt-banner">
           REFUNDED: receipt #{transaction.refund_id}
           <br />
-          {transaction.refund_cashier}, {dateTime(transaction.refund_timestamp)}
+          {transaction.refund_cashier}, {dateTime(transaction.refund_created_at)}
         </div>
       )}
 
@@ -34,7 +34,7 @@ function Receipt({ transaction, printing, refunding, onPrint, onRefund }) {
         </div>
         <div className="receipt-line">
           <span>Date</span>
-          <span>{dateTime(transaction.timestamp)}</span>
+          <span>{dateTime(transaction.created_at)}</span>
         </div>
         <div className="receipt-line">
           <span>Cashier</span>
@@ -42,22 +42,29 @@ function Receipt({ transaction, printing, refunding, onPrint, onRefund }) {
         </div>
         <div className="receipt-line">
           <span>Payment</span>
-          <span>{capitalize(transaction.tender)}</span>
+          <span>{transaction.payment_method}</span>
         </div>
       </div>
 
-      {transaction.items.map((item, index) => (
+      {transaction.lines.map((line, index) => (
         <div key={index} className="receipt-line">
           <span>
-            {item.quantity} x {item.name} @ {money(item.price)}
+            {line.quantity} x {line.description} @ {money(line.list_cents)}
           </span>
-          <span>{money(item.quantity * item.price)}</span>
+          <span>{money(line.quantity * line.list_cents)}</span>
         </div>
       ))}
 
+      {transaction.subtotal_cents !== transaction.total_cents && (
+        <div className="receipt-line">
+          <span>Offer accepted</span>
+          <span>{money(transaction.total_cents - transaction.subtotal_cents)}</span>
+        </div>
+      )}
+
       <div className="receipt-line receipt-total">
         <span>Total</span>
-        <span>{money(transaction.total)}</span>
+        <span>{money(transaction.total_cents)}</span>
       </div>
 
       <div className="receipt-actions">
@@ -78,7 +85,7 @@ function Receipt({ transaction, printing, refunding, onPrint, onRefund }) {
   );
 }
 
-function Journal({ api }) {
+function Journal({ api, event }) {
   const [start, setStart] = useState(today);
   const [end, setEnd] = useState(today);
   const [cashier, setCashier] = useState("");
@@ -97,7 +104,7 @@ function Journal({ api }) {
     if (start) params.set("start", start);
     if (end) params.set("end", end);
 
-    api(`/api/transactions?${params}`)
+    api(`/api/events/${event.id}/sales?${params}`)
       .then(async (response) => {
         const result = await response.json();
         if (ignore) return;
@@ -123,7 +130,7 @@ function Journal({ api }) {
     };
     // api is recreated on every render, so it must not retrigger the request
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [start, end, reloadCount, refreshTick]);
+  }, [event.id, start, end, reloadCount, refreshTick]);
 
   // Print once the chosen receipt has been marked as the only one to show
   useEffect(() => {
@@ -139,7 +146,7 @@ function Journal({ api }) {
   const refund = async (transaction) => {
     if (
       !window.confirm(
-        `Refund receipt #${transaction.id} for ${money(transaction.total)}? This can't be undone.`,
+        `Refund receipt #${transaction.id} for ${money(transaction.total_cents)}? This can't be undone.`,
       )
     ) {
       return;
@@ -147,7 +154,7 @@ function Journal({ api }) {
     setRefundingId(transaction.id);
     setError("");
     try {
-      const response = await api(`/api/transactions/${transaction.id}/refund`, {
+      const response = await api(`/api/events/${event.id}/sales/${transaction.id}/refund`, {
         method: "POST",
       });
       if (!response.ok) {
@@ -240,6 +247,7 @@ function Journal({ api }) {
         {shown.map((transaction) => (
           <Receipt
             key={transaction.id}
+            title={event.name}
             transaction={transaction}
             printing={printingId === transaction.id}
             refunding={refundingId === transaction.id}

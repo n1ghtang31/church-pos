@@ -1,22 +1,27 @@
 import hashlib
 import hmac
 import ipaddress
-import json
-import math
-import sqlite3
+import logging
 import os
 import re
-import logging
+import secrets
 import time
-from contextlib import closing
+from datetime import date, datetime, timedelta
+from functools import wraps
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import click
-from datetime import date, datetime, timedelta
+import psycopg
 from flask import Flask, g, jsonify, request, send_from_directory, session
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+from pos.money import CASH_BOX, allocate_discount, settle
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("church-pos")
+logger = logging.getLogger("sale-pos")
 
 # Serve built frontend from frontend_build if present
 static_dir = os.environ.get("FLASK_STATIC_DIR", "frontend_build")
@@ -25,10 +30,14 @@ app = Flask(__name__, static_folder=static_dir, static_url_path="/")
 # Refuse to start without credentials rather than run with the API open
 ADMIN_CODE = os.environ.get("ADMIN_CODE")
 SECRET_KEY = os.environ.get("SECRET_KEY")
-if not ADMIN_CODE or not SECRET_KEY:
-    raise RuntimeError("ADMIN_CODE and SECRET_KEY environment variables must be set")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not ADMIN_CODE or not SECRET_KEY or not DATABASE_URL:
+    raise RuntimeError("ADMIN_CODE, SECRET_KEY and DATABASE_URL environment variables must be set")
 if not re.fullmatch(r"[A-Za-z0-9]{8,32}", ADMIN_CODE):
     raise RuntimeError("ADMIN_CODE must be 8 to 32 letters or digits")
+
+# New events use this time zone, which decides which day a sale counts toward in reports
+DEFAULT_TIMEZONE = os.environ.get("POS_TIMEZONE", "America/Chicago")
 
 # Reverse proxies (such as nginx) whose X-Forwarded-For header is trusted, as IPs or CIDRs
 TRUSTED_PROXY_IPS = [
@@ -57,100 +66,49 @@ LOGIN_LOCKOUT_SECONDS = 5 * 60
 # Wrong codes older than this are forgotten
 FAILURE_WINDOW_SECONDS = 24 * 60 * 60
 
-# Database file path (default to data dir for a container)
-DB_FILE = os.environ.get("DB_FILE", "church_pos.db")
+MODES = ("charity", "yard_sale")
+PAYMENT_KINDS = ("cash", "check", "venmo", "card", "other")
+# Payment methods a new event starts with
+DEFAULT_PAYMENT_METHODS = {
+    "charity": [("Cash", "cash"), ("Check", "check"), ("Venmo", "venmo")],
+    "yard_sale": [("Cash", "cash")],
+}
+# No single line or sale may be more than this, which catches a misplaced decimal point
+MAX_CENTS = 10_000_000
+MAX_QUANTITY = 999
+# Event codes leave out letters and digits that are easy to mix up
+CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+CODE_LENGTH = 6
 
-# In-memory items
-ITEMS = [
-    {"id": 1, "name": "Nuts", "department": "Food"},
-    {"id": 2, "name": "Rada", "department": "Misc"},
-    {"id": 3, "name": "Baked Goods", "department": "Food"},
-    {"id": 4, "name": "Honey", "department": "Food"},
-    {"id": 5, "name": "Jam", "department": "Food"},
-    {"id": 6, "name": "Mom & Pop Shop", "department": "Misc"},
-    {"id": 7, "name": "Danny Duzits", "department": "Misc"},
-    {"id": 8, "name": "Crafts", "department": "Misc"},
-    {"id": 9, "name": "Donation", "department": "Misc"},
-]
+MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
-VALID_TENDERS = ["cash", "check", "venmo"]
-
-def init_db():
-    try:
-        # Ensure directory for DB exists
-        db_dir = os.path.dirname(DB_FILE)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-        conn = sqlite3.connect(DB_FILE)
-        conn.execute("PRAGMA journal_mode=WAL")
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                tender TEXT NOT NULL,
-                total REAL NOT NULL,
-                user TEXT NOT NULL
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS transaction_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                transaction_id INTEGER NOT NULL,
-                item_id INTEGER NOT NULL,
-                item_name TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                price REAL NOT NULL,
-                FOREIGN KEY (transaction_id) REFERENCES transactions(id)
-            )
-        """)
-        # AUTOINCREMENT so a removed cashier's id, and any session using it, is never reused
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS cashiers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                pin_hash TEXT NOT NULL UNIQUE
-            )
-        """)
-        # A refund is its own transaction with negative amounts, linked to the original sale.
-        # The unique index means a sale can only ever be refunded once.
-        columns = [row[1] for row in cursor.execute("PRAGMA table_info(transactions)")]
-        if "refund_of" not in columns:
-            cursor.execute("ALTER TABLE transactions ADD COLUMN refund_of INTEGER REFERENCES transactions(id)")
-        # Kept in the database so bans survive a restart
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS login_failures (
-                ip TEXT PRIMARY KEY,
-                failures INTEGER NOT NULL,
-                last_failure REAL NOT NULL,
-                banned INTEGER NOT NULL DEFAULT 0,
-                locked_until REAL
-            )
-        """)
-        cursor.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_refund_of
-            ON transactions(refund_of) WHERE refund_of IS NOT NULL
-        """)
-        conn.commit()
-        conn.close()
-        logger.info("Initialized SQLite DB at %s", DB_FILE)
-    except Exception:
-        logger.exception("Failed to initialize DB at %s", DB_FILE)
-        raise
+pool = ConnectionPool(
+    DATABASE_URL, min_size=1, max_size=10, kwargs={"row_factory": dict_row}, open=True
+)
 
 def get_db_connection():
-    try:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
-    except Exception:
-        logger.exception("Failed to get DB connection for %s", DB_FILE)
-        raise
+    """A pooled connection. Use it in a with block, which commits on success."""
+    return pool.connection()
 
-# Initialize DB at import time so it's ready under gunicorn.
+def run_migrations():
+    """Apply any migrations/NNN_*.sql files that haven't run yet, in order."""
+    with get_db_connection() as conn:
+        # Several workers may start at once, so only one migrates at a time
+        conn.execute("SELECT pg_advisory_xact_lock(4242)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        applied = {row["name"] for row in conn.execute("SELECT name FROM schema_migrations")}
+        for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            if path.name in applied:
+                continue
+            logger.info("Applying migration %s", path.name)
+            conn.execute(path.read_text())
+            conn.execute("INSERT INTO schema_migrations (name) VALUES (%s)", (path.name,))
+
+# Migrate at import time so it's ready under gunicorn.
 # If this fails, let it bubble so the process fails fast and logs show the problem.
-init_db()
+run_migrations()
 
 def client_ip():
     """The visitor's IP address.
@@ -178,7 +136,7 @@ def can_be_banned(ip):
 def login_block(conn, ip):
     """Return "banned" or "locked" if ip may not log in right now, otherwise None."""
     row = conn.execute(
-        "SELECT banned, locked_until FROM login_failures WHERE ip = ?", (ip,)
+        "SELECT banned, locked_until FROM login_failures WHERE ip = %s", (ip,)
     ).fetchone()
     if not row:
         return None
@@ -192,11 +150,11 @@ def record_login_failure(conn, ip):
     """Count a wrong code from ip. Returns "banned" or "locked" if this one blocked it."""
     now = time.time()
     conn.execute(
-        "DELETE FROM login_failures WHERE banned = 0 AND last_failure < ?",
+        "DELETE FROM login_failures WHERE NOT banned AND last_failure < %s",
         (now - FAILURE_WINDOW_SECONDS,),
     )
     row = conn.execute(
-        "SELECT failures, locked_until FROM login_failures WHERE ip = ?", (ip,)
+        "SELECT failures, locked_until FROM login_failures WHERE ip = %s FOR UPDATE", (ip,)
     ).fetchone()
     # Start counting again once an earlier lockout has expired
     if row is None or (row["locked_until"] and row["locked_until"] <= now):
@@ -204,12 +162,12 @@ def record_login_failure(conn, ip):
     else:
         failures = row["failures"] + 1
 
-    banned = 0
+    banned = False
     locked_until = None
     result = None
     if failures >= MAX_LOGIN_FAILURES:
         if can_be_banned(ip):
-            banned = 1
+            banned = True
             result = "banned"
         else:
             locked_until = now + LOGIN_LOCKOUT_SECONDS
@@ -217,15 +175,14 @@ def record_login_failure(conn, ip):
 
     conn.execute(
         """INSERT INTO login_failures (ip, failures, last_failure, banned, locked_until)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(ip) DO UPDATE SET
+           VALUES (%s, %s, %s, %s, %s)
+           ON CONFLICT (ip) DO UPDATE SET
                failures = excluded.failures,
                last_failure = excluded.last_failure,
                banned = excluded.banned,
                locked_until = excluded.locked_until""",
         (ip, failures, now, banned, locked_until),
     )
-    conn.commit()
     return result
 
 BLOCK_MESSAGES = {
@@ -233,24 +190,25 @@ BLOCK_MESSAGES = {
     "locked": "Too many wrong codes. Try again in 5 minutes.",
 }
 
-def hash_pin(pin):
+def hash_pin(event_id, pin):
     # Keyed so PINs can be looked up directly but can't be guessed from a copy of the database.
+    # The event id is included so the same PIN at two events doesn't hash the same.
     # Changing SECRET_KEY invalidates every PIN.
-    return hmac.new(SECRET_KEY.encode(), pin.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(SECRET_KEY.encode(), f"{event_id}:{pin}".encode(), hashlib.sha256).hexdigest()
 
 def current_user():
-    """Return the logged in user as {"role", "name"}, or None."""
+    """Return the logged in user as {"role", "name"} (plus "event_id" for a cashier), or None."""
     role = session.get("role")
     if role == "admin":
         return {"role": "admin", "name": "Admin"}
     if role == "cashier":
-        with closing(get_db_connection()) as conn:
+        with get_db_connection() as conn:
             cashier = conn.execute(
-                "SELECT name FROM cashiers WHERE id = ?", (session.get("cashier_id"),)
+                "SELECT name, event_id FROM cashiers WHERE id = %s", (session.get("cashier_id"),)
             ).fetchone()
         # A removed cashier is logged out on their next request
         if cashier:
-            return {"role": "cashier", "name": cashier["name"]}
+            return {"role": "cashier", "name": cashier["name"], "event_id": cashier["event_id"]}
         session.clear()
     return None
 
@@ -277,16 +235,51 @@ def require_login():
     g.user = current_user()
     if not g.user:
         return jsonify({"error": "Authentication required"}), 401
-    if request.path.startswith(("/api/cashiers", "/api/login-blocks")) and g.user["role"] != "admin":
+    if request.path.startswith("/api/login-blocks") and g.user["role"] != "admin":
         return jsonify({"error": "Admin access required"}), 403
-    if request.path == "/api/transactions" and request.method == "POST" and g.user["role"] != "cashier":
-        return jsonify({"error": "Log in as a cashier to record sales"}), 403
     return None
+
+def admin_only(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if g.user["role"] != "admin":
+            return jsonify({"error": "Admin access required"}), 403
+        return view(*args, **kwargs)
+    return wrapper
+
+def event_route(admin=False):
+    """Load the event in the URL into g.event, if this user may see it.
+
+    A cashier only ever sees their own event. Any other event looks like it doesn't
+    exist, so cashiers can't find out which events are on the site.
+    """
+    def decorator(view):
+        @wraps(view)
+        def wrapper(event_id, *args, **kwargs):
+            if g.user["role"] == "cashier" and g.user["event_id"] != event_id:
+                return jsonify({"error": "Event not found"}), 404
+            if admin and g.user["role"] != "admin":
+                return jsonify({"error": "Admin access required"}), 403
+            with get_db_connection() as conn:
+                g.event = conn.execute("SELECT * FROM events WHERE id = %s", (event_id,)).fetchone()
+            if not g.event:
+                return jsonify({"error": "Event not found"}), 404
+            return view(event_id, *args, **kwargs)
+        return wrapper
+    return decorator
+
+def require_open_event():
+    if g.event["status"] != "open":
+        return jsonify({"error": "This event is closed"}), 409
+    return None
+
+def iso(value):
+    return value.isoformat(timespec="seconds") if value else None
 
 @app.route("/api/health", methods=["GET"])
 def health():
     try:
-        with closing(get_db_connection()) as conn:
+        with get_db_connection() as conn:
             conn.execute("SELECT 1")
         return jsonify({"status": "ok"})
     except Exception:
@@ -300,32 +293,41 @@ def get_session():
 
 @app.route("/api/login", methods=["POST"])
 def login():
+    """Log in with the admin code, or with an event code and a cashier PIN."""
     ip = client_ip()
-    with closing(get_db_connection()) as conn:
+    with get_db_connection() as conn:
         block = login_block(conn, ip)
     if block:
         logger.warning("Login refused for %s address %s", block, ip)
         return jsonify({"error": BLOCK_MESSAGES[block]}), 403 if block == "banned" else 429
 
     data = request.get_json(silent=True)
-    code = data.get("code") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        data = {}
+    code = data.get("code")
+    event_code = data.get("event_code")
 
     role = None
     cashier = None
     if isinstance(code, str):
         if hmac.compare_digest(code.encode(), ADMIN_CODE.encode()):
             role = "admin"
-        else:
-            with closing(get_db_connection()) as conn:
-                cashier = conn.execute(
-                    "SELECT id FROM cashiers WHERE pin_hash = ?", (hash_pin(code),)
+        elif isinstance(event_code, str):
+            with get_db_connection() as conn:
+                event = conn.execute(
+                    "SELECT id FROM events WHERE code = %s", (event_code.strip().upper(),)
                 ).fetchone()
+                if event:
+                    cashier = conn.execute(
+                        "SELECT id FROM cashiers WHERE event_id = %s AND pin_hash = %s",
+                        (event["id"], hash_pin(event["id"], code)),
+                    ).fetchone()
             if cashier:
                 role = "cashier"
 
     if not role:
         logger.warning("Failed login from %s", ip)
-        with closing(get_db_connection()) as conn:
+        with get_db_connection() as conn:
             block = record_login_failure(conn, ip)
         if block:
             logger.warning("%s %s after %d wrong codes", block.capitalize(), ip, MAX_LOGIN_FAILURES)
@@ -333,9 +335,8 @@ def login():
         return jsonify({"error": "Incorrect code"}), 401
 
     # A correct code clears the count, so occasional typos never add up to a ban
-    with closing(get_db_connection()) as conn:
-        conn.execute("DELETE FROM login_failures WHERE ip = ?", (ip,))
-        conn.commit()
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM login_failures WHERE ip = %s", (ip,))
     session.clear()
     session.permanent = True
     session["role"] = role
@@ -352,22 +353,25 @@ def logout():
 def local_time(seconds):
     return datetime.fromtimestamp(seconds).isoformat(timespec="seconds") if seconds else None
 
+def blocked_addresses(conn):
+    return conn.execute(
+        """SELECT * FROM login_failures
+           WHERE banned OR locked_until > %s
+           ORDER BY last_failure DESC""",
+        (time.time(),),
+    ).fetchall()
+
 @app.route("/api/login-blocks", methods=["GET"])
 def get_login_blocks():
-    with closing(get_db_connection()) as conn:
-        rows = conn.execute(
-            """SELECT * FROM login_failures
-               WHERE banned = 1 OR locked_until > ?
-               ORDER BY last_failure DESC""",
-            (time.time(),),
-        ).fetchall()
+    with get_db_connection() as conn:
+        rows = blocked_addresses(conn)
     return jsonify(
         [
             {
                 "ip": row["ip"],
                 "failures": row["failures"],
                 "last_failure": local_time(row["last_failure"]),
-                "banned": bool(row["banned"]),
+                "banned": row["banned"],
                 "locked_until": local_time(row["locked_until"]),
             }
             for row in rows
@@ -376,9 +380,8 @@ def get_login_blocks():
 
 @app.route("/api/login-blocks/<ip>", methods=["DELETE"])
 def delete_login_block(ip):
-    with closing(get_db_connection()) as conn:
-        cursor = conn.execute("DELETE FROM login_failures WHERE ip = ?", (ip,))
-        conn.commit()
+    with get_db_connection() as conn:
+        cursor = conn.execute("DELETE FROM login_failures WHERE ip = %s", (ip,))
     if cursor.rowcount == 0:
         return jsonify({"error": "That address is not blocked"}), 404
     logger.warning("Admin unblocked %s", ip)
@@ -390,11 +393,8 @@ def delete_login_block(ip):
 @app.cli.command("bans")
 def list_bans_command():
     """List blocked addresses."""
-    with closing(get_db_connection()) as conn:
-        rows = conn.execute(
-            "SELECT * FROM login_failures WHERE banned = 1 OR locked_until > ? ORDER BY last_failure DESC",
-            (time.time(),),
-        ).fetchall()
+    with get_db_connection() as conn:
+        rows = blocked_addresses(conn)
     if not rows:
         click.echo("No addresses are blocked.")
     for row in rows:
@@ -408,18 +408,253 @@ def unban_command(ip, unban_all):
     """Unblock an address, or every address with --all."""
     if not ip and not unban_all:
         raise click.UsageError("Give an address to unblock, or --all.")
-    with closing(get_db_connection()) as conn:
+    with get_db_connection() as conn:
         if unban_all:
             cursor = conn.execute("DELETE FROM login_failures")
         else:
-            cursor = conn.execute("DELETE FROM login_failures WHERE ip = ?", (ip,))
-        conn.commit()
+            cursor = conn.execute("DELETE FROM login_failures WHERE ip = %s", (ip,))
     click.echo(f"Unblocked {cursor.rowcount} address(es).")
 
-def clean_cashier_name(name):
-    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 50:
-        raise ValueError("Name must be 1 to 50 characters")
-    return name.strip()
+# ----- Events -----
+
+def clean_text(value, field, max_length=50, required=True):
+    if value is None and not required:
+        return ""
+    if not isinstance(value, str) or len(value.strip()) > max_length or (required and not value.strip()):
+        raise ValueError(f"{field} must be {1 if required else 0} to {max_length} characters")
+    return value.strip()
+
+def clean_timezone(value):
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, TypeError, ValueError):
+        raise ValueError("Unknown time zone") from None
+    return value
+
+def new_event_code(conn):
+    while True:
+        code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
+        if not conn.execute("SELECT 1 FROM events WHERE code = %s", (code,)).fetchone():
+            return code
+
+def event_json(event):
+    return {
+        "id": event["id"],
+        "code": event["code"],
+        "name": event["name"],
+        "mode": event["mode"],
+        "status": event["status"],
+        "timezone": event["timezone"],
+        "created_at": iso(event["created_at"]),
+        "closed_at": iso(event["closed_at"]),
+    }
+
+@app.route("/api/events", methods=["GET"])
+def list_events():
+    with get_db_connection() as conn:
+        if g.user["role"] == "admin":
+            rows = conn.execute("SELECT * FROM events ORDER BY created_at DESC").fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM events WHERE id = %s", (g.user["event_id"],)).fetchall()
+    return jsonify([event_json(row) for row in rows])
+
+@app.route("/api/events", methods=["POST"])
+@admin_only
+def create_event():
+    data = request.get_json(silent=True) or {}
+    try:
+        name = clean_text(data.get("name"), "Name", 80)
+        if data.get("mode") not in MODES:
+            raise ValueError("Mode must be charity or yard_sale")
+        timezone = clean_timezone(data.get("timezone") or DEFAULT_TIMEZONE)
+    except (ValueError, AttributeError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    with get_db_connection() as conn:
+        event = conn.execute(
+            "INSERT INTO events (code, name, mode, timezone) VALUES (%s, %s, %s, %s) RETURNING *",
+            (new_event_code(conn), name, data["mode"], timezone),
+        ).fetchone()
+        for label, kind in DEFAULT_PAYMENT_METHODS[data["mode"]]:
+            conn.execute(
+                "INSERT INTO payment_methods (event_id, label, kind) VALUES (%s, %s, %s)",
+                (event["id"], label, kind),
+            )
+    return jsonify(event_json(event)), 201
+
+def event_setup(conn, event_id):
+    """Everything the register needs to ring up sales at an event."""
+    items = conn.execute(
+        "SELECT id, name, department FROM items WHERE event_id = %s AND active ORDER BY id", (event_id,)
+    ).fetchall()
+    sellers = conn.execute(
+        "SELECT id, name FROM sellers WHERE event_id = %s AND active ORDER BY id", (event_id,)
+    ).fetchall()
+    payment_methods = conn.execute(
+        """SELECT id, label, kind, holder_seller_id FROM payment_methods
+           WHERE event_id = %s AND active ORDER BY id""",
+        (event_id,),
+    ).fetchall()
+    return {"items": items, "sellers": sellers, "payment_methods": payment_methods}
+
+@app.route("/api/events/<int:event_id>", methods=["GET"])
+@event_route()
+def get_event(event_id):
+    with get_db_connection() as conn:
+        setup = event_setup(conn, event_id)
+    return jsonify({**event_json(g.event), **setup})
+
+@app.route("/api/events/<int:event_id>", methods=["PUT"])
+@event_route(admin=True)
+def update_event(event_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        name = clean_text(data.get("name", g.event["name"]), "Name", 80)
+        timezone = clean_timezone(data.get("timezone", g.event["timezone"]))
+    except (ValueError, AttributeError) as e:
+        return jsonify({"error": str(e)}), 400
+    with get_db_connection() as conn:
+        event = conn.execute(
+            "UPDATE events SET name = %s, timezone = %s WHERE id = %s RETURNING *",
+            (name, timezone, event_id),
+        ).fetchone()
+    return jsonify(event_json(event))
+
+@app.route("/api/events/<int:event_id>", methods=["DELETE"])
+@event_route(admin=True)
+def delete_event(event_id):
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM events WHERE id = %s", (event_id,))
+    logger.warning("Admin deleted event %s (%s)", event_id, g.event["name"])
+    return "", 204
+
+@app.route("/api/events/<int:event_id>/close", methods=["POST"])
+@event_route(admin=True)
+def close_event(event_id):
+    with get_db_connection() as conn:
+        event = conn.execute(
+            """UPDATE events SET status = 'closed', closed_at = COALESCE(closed_at, now())
+               WHERE id = %s RETURNING *""",
+            (event_id,),
+        ).fetchone()
+    return jsonify(event_json(event))
+
+@app.route("/api/events/<int:event_id>/reopen", methods=["POST"])
+@event_route(admin=True)
+def reopen_event(event_id):
+    with get_db_connection() as conn:
+        event = conn.execute(
+            "UPDATE events SET status = 'open', closed_at = NULL WHERE id = %s RETURNING *",
+            (event_id,),
+        ).fetchone()
+    return jsonify(event_json(event))
+
+# ----- Items, sellers and payment methods -----
+
+def clean_item(conn, data):
+    if g.event["mode"] != "charity":
+        raise ValueError("Items are only used at a charity drive")
+    return {
+        "name": clean_text(data.get("name"), "Name"),
+        "department": clean_text(data.get("department"), "Department", required=False),
+    }
+
+def clean_seller(conn, data):
+    if g.event["mode"] != "yard_sale":
+        raise ValueError("Sellers are only used at a yard sale")
+    return {"name": clean_text(data.get("name"), "Name")}
+
+def clean_payment_method(conn, data):
+    if data.get("kind") not in PAYMENT_KINDS:
+        raise ValueError(f"Kind must be one of: {', '.join(PAYMENT_KINDS)}")
+    holder = data.get("holder_seller_id")
+    if holder is not None:
+        if g.event["mode"] != "yard_sale":
+            raise ValueError("Only a yard sale payment method can go to a seller")
+        if type(holder) is not int or not conn.execute(
+            "SELECT 1 FROM sellers WHERE id = %s AND event_id = %s AND active", (holder, g.event["id"])
+        ).fetchone():
+            raise ValueError("Unknown seller")
+    return {
+        "label": clean_text(data.get("label"), "Label"),
+        "kind": data["kind"],
+        "holder_seller_id": holder,
+    }
+
+# The URL name of each kind of setup row, with its table and how to check what's sent
+SETUP_KINDS = {
+    "items": ("items", clean_item),
+    "sellers": ("sellers", clean_seller),
+    "payment-methods": ("payment_methods", clean_payment_method),
+}
+
+@app.route("/api/events/<int:event_id>/<kind>", methods=["POST"])
+@event_route(admin=True)
+def create_setup_row(event_id, kind):
+    if kind not in SETUP_KINDS:
+        return jsonify({"error": "Not found"}), 404
+    table, clean = SETUP_KINDS[kind]
+    data = request.get_json(silent=True) or {}
+    with get_db_connection() as conn:
+        try:
+            fields = clean(conn, data)
+        except (ValueError, AttributeError) as e:
+            return jsonify({"error": str(e)}), 400
+        columns = ", ".join(["event_id", *fields])
+        placeholders = ", ".join(["%s"] * (len(fields) + 1))
+        row = conn.execute(
+            f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) RETURNING *",
+            (event_id, *fields.values()),
+        ).fetchone()
+    return jsonify(row), 201
+
+@app.route("/api/events/<int:event_id>/<kind>/<int:row_id>", methods=["PUT"])
+@event_route(admin=True)
+def update_setup_row(event_id, kind, row_id):
+    if kind not in SETUP_KINDS:
+        return jsonify({"error": "Not found"}), 404
+    table, clean = SETUP_KINDS[kind]
+    data = request.get_json(silent=True) or {}
+    with get_db_connection() as conn:
+        try:
+            fields = clean(conn, data)
+        except (ValueError, AttributeError) as e:
+            return jsonify({"error": str(e)}), 400
+        assignments = ", ".join(f"{column} = %s" for column in fields)
+        row = conn.execute(
+            f"UPDATE {table} SET {assignments} WHERE id = %s AND event_id = %s AND active RETURNING *",
+            (*fields.values(), row_id, event_id),
+        ).fetchone()
+    if not row:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(row)
+
+@app.route("/api/events/<int:event_id>/<kind>/<int:row_id>", methods=["DELETE"])
+@event_route(admin=True)
+def delete_setup_row(event_id, kind, row_id):
+    if kind not in SETUP_KINDS:
+        return jsonify({"error": "Not found"}), 404
+    table, _ = SETUP_KINDS[kind]
+    with get_db_connection() as conn:
+        if kind == "sellers" and conn.execute(
+            "SELECT 1 FROM payment_methods WHERE holder_seller_id = %s AND active", (row_id,)
+        ).fetchone():
+            return jsonify({"error": "A payment method still goes to this seller"}), 409
+        try:
+            with conn.transaction():
+                cursor = conn.execute(
+                    f"DELETE FROM {table} WHERE id = %s AND event_id = %s", (row_id, event_id)
+                )
+        except psycopg.errors.ForeignKeyViolation:
+            # Already on a sale, so hide it instead and keep the sale's history whole
+            cursor = conn.execute(
+                f"UPDATE {table} SET active = FALSE WHERE id = %s AND event_id = %s", (row_id, event_id)
+            )
+    if cursor.rowcount == 0:
+        return jsonify({"error": "Not found"}), 404
+    return "", 204
+
+# ----- Cashiers -----
 
 def clean_cashier_pin(pin):
     if not isinstance(pin, str) or not re.fullmatch(r"[0-9]{4,8}", pin):
@@ -429,221 +664,229 @@ def clean_cashier_pin(pin):
     return pin
 
 def cashier_conflict_message(error):
-    if "cashiers.name" in str(error):
+    if error.diag.constraint_name == "idx_cashiers_event_name":
         return "A cashier with that name already exists"
     return "That PIN is not available"
 
-@app.route("/api/cashiers", methods=["GET"])
-def get_cashiers():
-    with closing(get_db_connection()) as conn:
-        rows = conn.execute("SELECT id, name FROM cashiers ORDER BY name").fetchall()
-    return jsonify([{"id": row["id"], "name": row["name"]} for row in rows])
+@app.route("/api/events/<int:event_id>/cashiers", methods=["GET"])
+@event_route(admin=True)
+def get_cashiers(event_id):
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, name FROM cashiers WHERE event_id = %s ORDER BY name", (event_id,)
+        ).fetchall()
+    return jsonify(rows)
 
-@app.route("/api/cashiers", methods=["POST"])
-def create_cashier():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({"error": "No data provided"}), 400
+@app.route("/api/events/<int:event_id>/cashiers", methods=["POST"])
+@event_route(admin=True)
+def create_cashier(event_id):
+    data = request.get_json(silent=True) or {}
     try:
-        name = clean_cashier_name(data.get("name"))
+        name = clean_text(data.get("name"), "Name")
         pin = clean_cashier_pin(data.get("pin"))
-    except ValueError as e:
+    except (ValueError, AttributeError) as e:
         return jsonify({"error": str(e)}), 400
-
     try:
-        with closing(get_db_connection()) as conn:
-            cursor = conn.execute(
-                "INSERT INTO cashiers (name, pin_hash) VALUES (?, ?)", (name, hash_pin(pin))
-            )
-            conn.commit()
-    except sqlite3.IntegrityError as e:
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "INSERT INTO cashiers (event_id, name, pin_hash) VALUES (%s, %s, %s) RETURNING id, name",
+                (event_id, name, hash_pin(event_id, pin)),
+            ).fetchone()
+    except psycopg.errors.UniqueViolation as e:
         return jsonify({"error": cashier_conflict_message(e)}), 409
-    return jsonify({"id": cursor.lastrowid, "name": name}), 201
+    return jsonify(row), 201
 
-@app.route("/api/cashiers/<int:cashier_id>", methods=["PUT"])
-def update_cashier(cashier_id):
-    """Update a cashier's name and/or PIN. Fields left out stay the same."""
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({"error": "No data provided"}), 400
-
-    updates = {}
+@app.route("/api/events/<int:event_id>/cashiers/<int:cashier_id>", methods=["PUT"])
+@event_route(admin=True)
+def update_cashier(event_id, cashier_id):
+    """Rename a cashier and/or set a new PIN. Leave pin out to keep the current one."""
+    data = request.get_json(silent=True) or {}
     try:
-        if "name" in data:
-            updates["name"] = clean_cashier_name(data["name"])
-        if "pin" in data:
-            updates["pin_hash"] = hash_pin(clean_cashier_pin(data["pin"]))
-    except ValueError as e:
+        name = clean_text(data.get("name"), "Name")
+        pin = data.get("pin")
+        pin_hash = hash_pin(event_id, clean_cashier_pin(pin)) if pin not in (None, "") else None
+    except (ValueError, AttributeError) as e:
         return jsonify({"error": str(e)}), 400
-    if not updates:
-        return jsonify({"error": "Nothing to update"}), 400
-
-    # Column names come from the fixed keys above, never from the request
-    assignments = ", ".join(f"{column} = ?" for column in updates)
     try:
-        with closing(get_db_connection()) as conn:
-            cursor = conn.execute(
-                f"UPDATE cashiers SET {assignments} WHERE id = ?",
-                (*updates.values(), cashier_id),
-            )
-            conn.commit()
-            if cursor.rowcount == 0:
-                return jsonify({"error": "Cashier not found"}), 404
-            row = conn.execute("SELECT id, name FROM cashiers WHERE id = ?", (cashier_id,)).fetchone()
-    except sqlite3.IntegrityError as e:
+        with get_db_connection() as conn:
+            row = conn.execute(
+                """UPDATE cashiers SET name = %s, pin_hash = COALESCE(%s, pin_hash)
+                   WHERE id = %s AND event_id = %s RETURNING id, name""",
+                (name, pin_hash, cashier_id, event_id),
+            ).fetchone()
+    except psycopg.errors.UniqueViolation as e:
         return jsonify({"error": cashier_conflict_message(e)}), 409
-    return jsonify({"id": row["id"], "name": row["name"]})
+    if not row:
+        return jsonify({"error": "Cashier not found"}), 404
+    return jsonify(row)
 
-@app.route("/api/cashiers/<int:cashier_id>", methods=["DELETE"])
-def delete_cashier(cashier_id):
-    # Past sales keep the cashier's name, which is stored on each transaction
-    with closing(get_db_connection()) as conn:
-        cursor = conn.execute("DELETE FROM cashiers WHERE id = ?", (cashier_id,))
-        conn.commit()
+@app.route("/api/events/<int:event_id>/cashiers/<int:cashier_id>", methods=["DELETE"])
+@event_route(admin=True)
+def delete_cashier(event_id, cashier_id):
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM cashiers WHERE id = %s AND event_id = %s", (cashier_id, event_id)
+        )
     if cursor.rowcount == 0:
         return jsonify({"error": "Cashier not found"}), 404
     return "", 204
 
-@app.route("/api/items", methods=["GET"])
-def get_items():
-    return jsonify(ITEMS)
+# ----- Sales -----
 
-def validate_line_items(raw_items):
-    """Return clean line items, or raise ValueError so bad sales never reach the reports."""
-    if not isinstance(raw_items, list) or not raw_items:
-        raise ValueError("Transaction must contain at least one item")
+def is_cents(value, allow_zero=False):
+    return type(value) is int and (0 if allow_zero else 1) <= value <= MAX_CENTS
 
-    line_items = []
-    for raw in raw_items:
+def validate_lines(conn, raw_lines):
+    """Return clean sale lines, or raise ValueError so bad sales never reach the reports.
+
+    At a charity drive each line names an item. At a yard sale it names whose stuff it is.
+    """
+    if not isinstance(raw_lines, list) or not raw_lines:
+        raise ValueError("A sale must have at least one item")
+    if len(raw_lines) > 200:
+        raise ValueError("Too many items in one sale")
+
+    charity = g.event["mode"] == "charity"
+    lookup = conn.execute(
+        f"SELECT id, name FROM {'items' if charity else 'sellers'} WHERE event_id = %s AND active",
+        (g.event["id"],),
+    ).fetchall()
+    names = {row["id"]: row["name"] for row in lookup}
+
+    lines = []
+    for raw in raw_lines:
         if not isinstance(raw, dict):
             raise ValueError("Invalid item")
-        item_id = raw.get("id")
-        found_item = next((i for i in ITEMS if i["id"] == item_id), None)
-        if not found_item:
-            raise ValueError(f"Unknown item: {item_id}")
+        ref = raw.get("item_id" if charity else "seller_id")
+        if type(ref) is not int or ref not in names:
+            raise ValueError("Unknown item" if charity else "Unknown seller")
 
         quantity = raw.get("quantity", 1)
-        if type(quantity) is not int or quantity < 1:
-            raise ValueError(f"Invalid quantity for {found_item['name']}")
+        if type(quantity) is not int or not 1 <= quantity <= MAX_QUANTITY:
+            raise ValueError(f"Invalid quantity for {names[ref]}")
+        price = raw.get("price_cents")
+        if not is_cents(price) or price * quantity > MAX_CENTS:
+            raise ValueError(f"Invalid price for {names[ref]}")
+        note = clean_text(raw.get("description"), "Description", 80, required=False)
 
-        price = raw.get("price")
-        if type(price) not in (int, float) or not math.isfinite(price) or round(price, 2) <= 0:
-            raise ValueError(f"Invalid price for {found_item['name']}")
-
-        line_items.append(
-            {"id": found_item["id"], "name": found_item["name"], "quantity": quantity, "price": round(price, 2)}
+        lines.append(
+            {
+                "item_id": ref if charity else None,
+                "seller_id": None if charity else ref,
+                "description": note or names[ref],
+                "quantity": quantity,
+                "list_cents": price,
+            }
         )
-    return line_items
+    return lines
 
-@app.route("/api/transactions", methods=["POST"])
-def create_transaction():
-    try:
-        data = request.get_json(silent=True)
-        if not data or not isinstance(data, dict):
-            return jsonify({"error": "No data provided"}), 400
-        if "items" not in data or "tender" not in data:
-            return jsonify({"error": "Missing required fields: items, tender"}), 400
-        if data["tender"] not in VALID_TENDERS:
-            return jsonify({"error": f"Invalid tender. Must be one of: {', '.join(VALID_TENDERS)}"}), 400
+@app.route("/api/events/<int:event_id>/sales", methods=["POST"])
+@event_route()
+def create_sale(event_id):
+    if g.user["role"] != "cashier":
+        return jsonify({"error": "Log in as a cashier to record sales"}), 403
+    if closed := require_open_event():
+        return closed
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "No data provided"}), 400
 
+    with get_db_connection() as conn:
+        method = conn.execute(
+            "SELECT id, label FROM payment_methods WHERE id = %s AND event_id = %s AND active",
+            (data.get("payment_method_id"), event_id),
+        ).fetchone() if type(data.get("payment_method_id")) is int else None
+        if not method:
+            return jsonify({"error": "Choose how the customer is paying"}), 400
         try:
-            line_items = validate_line_items(data["items"])
+            lines = validate_lines(conn, data.get("lines"))
+            line_totals = [line["list_cents"] * line["quantity"] for line in lines]
+            subtotal = sum(line_totals)
+            if subtotal > MAX_CENTS:
+                raise ValueError("The sale is too large")
+            # A total lower than the items add up to is an agreed price for the lot
+            total = data.get("total_cents", subtotal)
+            if not is_cents(total, allow_zero=True):
+                raise ValueError("Invalid total")
+            shares = allocate_discount(line_totals, total)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
 
-        total = sum(item["price"] * item["quantity"] for item in line_items)
-
-        timestamp = datetime.now().isoformat()
-        tender = data["tender"]
-        total = round(total, 2)
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO transactions (timestamp, tender, total, user) VALUES (?, ?, ?, ?)",
-            (timestamp, tender, total, g.user["name"]),
-        )
-        transaction_id = cursor.lastrowid
-
-        for item in line_items:
-            cursor.execute(
-                """INSERT INTO transaction_items
-                   (transaction_id, item_id, item_name, quantity, price)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (
-                    transaction_id,
-                    item["id"],
-                    item["name"],
-                    item["quantity"],
-                    item["price"],
-                ),
-            )
-
-        conn.commit()
-        conn.close()
-
-        transaction = {
-            "id": transaction_id,
-            "timestamp": timestamp,
-            "items": line_items,
-            "tender": tender,
-            "total": total,
-        }
-        return jsonify(transaction), 201
-
-    except Exception:
-        logger.exception("Error creating transaction")
-        return jsonify({"error": "Internal server error while creating transaction"}), 500
-
-@app.route("/api/transactions/<int:transaction_id>/refund", methods=["POST"])
-def refund_transaction(transaction_id):
-    """Refund a whole sale by recording a negative transaction against it."""
-    try:
-        with closing(get_db_connection()) as conn:
-            original = conn.execute(
-                "SELECT * FROM transactions WHERE id = ?", (transaction_id,)
-            ).fetchone()
-            if not original:
-                return jsonify({"error": "Transaction not found"}), 404
-            if original["refund_of"] is not None:
-                return jsonify({"error": "A refund cannot be refunded"}), 400
-
-            timestamp = datetime.now().isoformat()
-            total = -original["total"]
-            try:
-                cursor = conn.execute(
-                    """INSERT INTO transactions (timestamp, tender, total, user, refund_of)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (timestamp, original["tender"], total, g.user["name"], transaction_id),
-                )
-            except sqlite3.IntegrityError:
-                return jsonify({"error": "This sale has already been refunded"}), 409
-            refund_id = cursor.lastrowid
+        sale = conn.execute(
+            """INSERT INTO sales (event_id, cashier_name, payment_method_id, subtotal_cents, total_cents)
+               VALUES (%s, %s, %s, %s, %s) RETURNING *""",
+            (event_id, g.user["name"], method["id"], subtotal, total),
+        ).fetchone()
+        for line, share in zip(lines, shares):
+            line["final_cents"] = share
             conn.execute(
-                """INSERT INTO transaction_items
-                   (transaction_id, item_id, item_name, quantity, price)
-                   SELECT ?, item_id, item_name, -quantity, price
-                   FROM transaction_items WHERE transaction_id = ?""",
-                (refund_id, transaction_id),
+                """INSERT INTO sale_lines
+                   (sale_id, event_id, item_id, seller_id, description, quantity, list_cents, final_cents)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                (sale["id"], event_id, line["item_id"], line["seller_id"], line["description"],
+                 line["quantity"], line["list_cents"], share),
             )
-            conn.commit()
+    return jsonify({**sale_json(sale, method["label"]), "lines": lines}), 201
 
-        return jsonify(
-            {
-                "id": refund_id,
-                "timestamp": timestamp,
-                "tender": original["tender"],
-                "total": total,
-                "cashier": g.user["name"],
-                "refund_of": transaction_id,
-            }
-        ), 201
-    except Exception:
-        logger.exception("Error refunding transaction %s", transaction_id)
-        return jsonify({"error": "Internal server error while refunding transaction"}), 500
+def sale_json(sale, payment_label):
+    return {
+        "id": sale["id"],
+        "created_at": iso(sale["created_at"]),
+        "cashier": sale["cashier_name"],
+        "payment_method_id": sale["payment_method_id"],
+        "payment_method": payment_label,
+        "subtotal_cents": sale["subtotal_cents"],
+        "total_cents": sale["total_cents"],
+        "refund_of": sale["refund_of"],
+    }
+
+@app.route("/api/events/<int:event_id>/sales/<int:sale_id>/refund", methods=["POST"])
+@event_route()
+def refund_sale(event_id, sale_id):
+    """Refund a whole sale by recording a negative sale against it."""
+    if closed := require_open_event():
+        return closed
+    with get_db_connection() as conn:
+        original = conn.execute(
+            """SELECT s.*, pm.label FROM sales s JOIN payment_methods pm ON pm.id = s.payment_method_id
+               WHERE s.id = %s AND s.event_id = %s""",
+            (sale_id, event_id),
+        ).fetchone()
+        if not original:
+            return jsonify({"error": "Sale not found"}), 404
+        if original["refund_of"] is not None:
+            return jsonify({"error": "A refund cannot be refunded"}), 400
+        try:
+            with conn.transaction():
+                refund = conn.execute(
+                    """INSERT INTO sales
+                       (event_id, cashier_name, payment_method_id, subtotal_cents, total_cents, refund_of)
+                       VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
+                    (event_id, g.user["name"], original["payment_method_id"],
+                     -original["subtotal_cents"], -original["total_cents"], sale_id),
+                ).fetchone()
+        except psycopg.errors.UniqueViolation:
+            return jsonify({"error": "This sale has already been refunded"}), 409
+        conn.execute(
+            """INSERT INTO sale_lines
+               (sale_id, event_id, item_id, seller_id, description, quantity, list_cents, final_cents)
+               SELECT %s, event_id, item_id, seller_id, description, -quantity, list_cents, -final_cents
+               FROM sale_lines WHERE sale_id = %s""",
+            (refund["id"], sale_id),
+        )
+    return jsonify(sale_json(refund, original["label"])), 201
+
+def parse_report_date(value):
+    """Return a date, or None if no date was given."""
+    if not value:
+        return None
+    return date.fromisoformat(value)
 
 def date_range_filter():
-    """Read optional start/end args. Returns (start, end, where_sql, params) for the alias t."""
+    """Read optional start/end args. Returns (start, end, where_sql, params) for the alias s.
+
+    Days are counted in the event's time zone.
+    """
     try:
         start = parse_report_date(request.args.get("start"))
         end = parse_report_date(request.args.get("end"))
@@ -652,272 +895,220 @@ def date_range_filter():
     if start and end and start > end:
         raise ValueError("Start date must not be after end date")
 
-    # Timestamps are local ISO strings, so the first 10 characters are the date
-    where = []
-    params = []
+    where = ["s.event_id = %s"]
+    params = [g.event["id"]]
     if start:
-        where.append("substr(t.timestamp, 1, 10) >= ?")
-        params.append(start)
+        where.append("(s.created_at AT TIME ZONE %s)::date >= %s")
+        params += [g.event["timezone"], start]
     if end:
-        where.append("substr(t.timestamp, 1, 10) <= ?")
-        params.append(end)
-    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-    return start, end, where_sql, params
+        where.append("(s.created_at AT TIME ZONE %s)::date <= %s")
+        params += [g.event["timezone"], end]
+    return start, end, f"WHERE {' AND '.join(where)}", params
 
-@app.route("/api/transactions", methods=["GET"])
-def get_transactions():
+@app.route("/api/events/<int:event_id>/sales", methods=["GET"])
+@event_route()
+def list_sales(event_id):
     try:
         _, _, where_sql, params = date_range_filter()
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            f"""SELECT t.*, r.id AS refund_id, r.timestamp AS refund_timestamp, r.user AS refund_cashier
-                FROM transactions t
-                LEFT JOIN transactions r ON r.refund_of = t.id
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            f"""SELECT s.*, pm.label, r.id AS refund_id, r.created_at AS refund_created_at,
+                       r.cashier_name AS refund_cashier
+                FROM sales s
+                JOIN payment_methods pm ON pm.id = s.payment_method_id
+                LEFT JOIN sales r ON r.refund_of = s.id
                 {where_sql}
-                ORDER BY t.id""",
+                ORDER BY s.id""",
             params,
-        )
-        rows = cursor.fetchall()
-        transactions = []
-        for row in rows:
-            cursor.execute(
-                """SELECT item_id, item_name, quantity, price
-                   FROM transaction_items
-                   WHERE transaction_id = ?""",
-                (row["id"],),
-            )
-            items = cursor.fetchall()
-            transactions.append(
-                {
-                    "id": row["id"],
-                    "timestamp": row["timestamp"],
-                    "items": [
-                        {
-                            "id": item["item_id"],
-                            "name": item["item_name"],
-                            "quantity": item["quantity"],
-                            "price": item["price"],
-                        }
-                        for item in items
-                    ],
-                    "tender": row["tender"],
-                    "total": row["total"],
-                    "cashier": row["user"],
-                    "refund_of": row["refund_of"],
-                    "refund_id": row["refund_id"],
-                    "refund_timestamp": row["refund_timestamp"],
-                    "refund_cashier": row["refund_cashier"],
-                }
-            )
-        conn.close()
-        return jsonify(transactions)
-    except Exception:
-        logger.exception("Error fetching transactions")
-        return jsonify({"error": "Internal server error while fetching transactions"}), 500
+        ).fetchall()
+        lines = conn.execute(
+            """SELECT sale_id, item_id, seller_id, description, quantity, list_cents, final_cents
+               FROM sale_lines WHERE sale_id = ANY(%s) ORDER BY id""",
+            ([row["id"] for row in rows],),
+        ).fetchall()
 
-@app.route("/api/stats", methods=["GET"])
-def get_stats():
-    try:
-        stats = {
-            "cash": {"count": 0, "total": 0},
-            "check": {"count": 0, "total": 0},
-            "venmo": {"count": 0, "total": 0},
-        }
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT tender, total, refund_of FROM transactions")
-        rows = cursor.fetchall()
-        conn.close()
-
-        for row in rows:
-            tender = row["tender"]
-            if tender not in stats:
-                # Add unexpected tender types safely
-                stats[tender] = {"count": 0, "total": 0}
-            stats[tender]["count"] += -1 if row["refund_of"] else 1
-            stats[tender]["total"] += row["total"]
-
-        overall_total = sum(stats[t]["total"] for t in stats)
-        overall_count = sum(stats[t]["count"] for t in stats)
-
-        return jsonify(
-            {"by_tender": stats, "overall": {"count": overall_count, "total": round(overall_total, 2)}}
-        )
-    except Exception:
-        logger.exception("Error computing stats")
-        return jsonify({"error": "Internal server error while computing stats"}), 500
-
-@app.route("/api/item-sales", methods=["GET"])
-def get_item_sales():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT 
-                item_id,
-                item_name,
-                SUM(quantity) as total_quantity,
-                SUM(quantity * price) as total_amount
-            FROM transaction_items
-            GROUP BY item_id, item_name
-            ORDER BY total_amount DESC
-        """)
-        rows = cursor.fetchall()
-        conn.close()
-
-        item_sales = [
+    lines_by_sale = {}
+    for line in lines:
+        lines_by_sale.setdefault(line.pop("sale_id"), []).append(line)
+    return jsonify(
+        [
             {
-                "id": row["item_id"],
-                "name": row["item_name"],
-                "total_quantity": row["total_quantity"],
-                "total_amount": round(row["total_amount"], 2),
+                **sale_json(row, row["label"]),
+                "lines": lines_by_sale.get(row["id"], []),
+                "refund_id": row["refund_id"],
+                "refund_created_at": iso(row["refund_created_at"]),
+                "refund_cashier": row["refund_cashier"],
             }
             for row in rows
         ]
+    )
 
-        return jsonify(item_sales)
-    except Exception:
-        logger.exception("Error fetching item sales")
-        return jsonify({"error": "Internal server error while fetching item sales"}), 500
-
-def parse_report_date(value):
-    """Return a YYYY-MM-DD string, or None if no date was given."""
-    if not value:
-        return None
-    return date.fromisoformat(value).isoformat()
-
-@app.route("/api/reports/summary", methods=["GET"])
-def get_report_summary():
-    """Daily multi-totals and single-item totals, optionally limited to start..end (inclusive)."""
+@app.route("/api/events/<int:event_id>/report", methods=["GET"])
+@event_route()
+def get_report(event_id):
+    """Totals by day, payment method, cashier, and item or seller, optionally for start..end."""
     try:
         start, end, where_sql, params = date_range_filter()
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    try:
-        # Refunds are negative transactions, so summed amounts and quantities are already
-        # net of them. Counts subtract a refund, and refunds are also reported separately.
-        net_count = "SUM(CASE WHEN t.refund_of IS NULL THEN 1 ELSE -1 END)"
-        refund_count = "SUM(CASE WHEN t.refund_of IS NULL THEN 0 ELSE 1 END)"
-        refund_total = "SUM(CASE WHEN t.refund_of IS NULL THEN 0 ELSE t.total END)"
+    # Refunds are negative sales, so summed amounts and quantities are already net of
+    # them. Counts subtract a refund, and refunds are also reported separately.
+    net_count = "SUM(CASE WHEN s.refund_of IS NULL THEN 1 ELSE -1 END)::int"
+    refund_count = "SUM(CASE WHEN s.refund_of IS NULL THEN 0 ELSE 1 END)::int"
+    refund_total = "SUM(CASE WHEN s.refund_of IS NULL THEN 0 ELSE s.total_cents END)::bigint"
+    sale_date = "(s.created_at AT TIME ZONE %s)::date"
 
-        with closing(get_db_connection()) as conn:
-            tender_rows = conn.execute(
-                f"""SELECT substr(t.timestamp, 1, 10) AS sale_date, t.tender,
-                           {net_count} AS count, SUM(t.total) AS total,
-                           {refund_count} AS refund_count, {refund_total} AS refund_total
-                    FROM transactions t {where_sql}
-                    GROUP BY sale_date, t.tender
-                    ORDER BY sale_date""",
-                params,
-            ).fetchall()
-            cashier_rows = conn.execute(
-                f"""SELECT t.user AS cashier, {net_count} AS count, SUM(t.total) AS total,
-                           {refund_total} AS refund_total
-                    FROM transactions t {where_sql}
-                    GROUP BY t.user
-                    ORDER BY total DESC""",
-                params,
-            ).fetchall()
-            item_rows = conn.execute(
-                f"""SELECT ti.item_id, ti.item_name,
-                           SUM(ti.quantity) AS quantity,
-                           SUM(ti.quantity * ti.price) AS total
-                    FROM transaction_items ti
-                    JOIN transactions t ON t.id = ti.transaction_id
-                    {where_sql}
-                    GROUP BY ti.item_id, ti.item_name
-                    ORDER BY total DESC""",
-                params,
-            ).fetchall()
+    with get_db_connection() as conn:
+        method_rows = conn.execute(
+            f"""SELECT {sale_date} AS sale_date, pm.id AS payment_method_id, pm.label,
+                       {net_count} AS count, SUM(s.total_cents)::bigint AS total_cents,
+                       {refund_count} AS refund_count, {refund_total} AS refund_cents,
+                       SUM(s.subtotal_cents - s.total_cents)::bigint AS discount_cents
+                FROM sales s JOIN payment_methods pm ON pm.id = s.payment_method_id
+                {where_sql}
+                GROUP BY sale_date, pm.id, pm.label
+                ORDER BY sale_date, pm.id""",
+            [g.event["timezone"], *params],
+        ).fetchall()
+        cashier_rows = conn.execute(
+            f"""SELECT s.cashier_name AS cashier, {net_count} AS count,
+                       SUM(s.total_cents)::bigint AS total_cents, {refund_total} AS refund_cents
+                FROM sales s {where_sql}
+                GROUP BY s.cashier_name
+                ORDER BY total_cents DESC""",
+            params,
+        ).fetchall()
+        line_rows = conn.execute(
+            f"""SELECT COALESCE(sl.item_id, sl.seller_id) AS id,
+                       COALESCE(i.name, se.name) AS name, COALESCE(i.department, '') AS department,
+                       SUM(sl.quantity)::int AS quantity,
+                       SUM(sl.quantity * sl.list_cents)::bigint AS list_cents,
+                       SUM(sl.final_cents)::bigint AS total_cents
+                FROM sale_lines sl
+                JOIN sales s ON s.id = sl.sale_id
+                LEFT JOIN items i ON i.id = sl.item_id
+                LEFT JOIN sellers se ON se.id = sl.seller_id
+                {where_sql}
+                GROUP BY 1, 2, 3
+                ORDER BY total_cents DESC""",
+            params,
+        ).fetchall()
 
-        by_tender = {tender: {"count": 0, "total": 0} for tender in VALID_TENDERS}
-        by_day = {}
-        refunds = {"count": 0, "total": 0}
-        for row in tender_rows:
-            refunds["count"] += row["refund_count"]
-            refunds["total"] += row["refund_total"]
-            tender = by_tender.setdefault(row["tender"], {"count": 0, "total": 0})
-            tender["count"] += row["count"]
-            tender["total"] += row["total"]
-
-            day = by_day.setdefault(
-                row["sale_date"],
-                {
-                    "date": row["sale_date"],
-                    "count": 0,
-                    "total": 0,
-                    "refunds": 0,
-                    "tenders": {t: 0 for t in VALID_TENDERS},
-                },
-            )
-            day["count"] += row["count"]
-            day["total"] += row["total"]
-            day["refunds"] += row["refund_total"]
-            day["tenders"][row["tender"]] = day["tenders"].get(row["tender"], 0) + row["total"]
-
-        for tender in by_tender.values():
-            tender["total"] = round(tender["total"], 2)
-        for day in by_day.values():
-            day["total"] = round(day["total"], 2)
-            day["refunds"] = round(day["refunds"], 2)
-            day["tenders"] = {t: round(amount, 2) for t, amount in day["tenders"].items()}
-
-        departments = {item["id"]: item["department"] for item in ITEMS}
-        items = []
-        by_department = {}
-        for row in item_rows:
-            department = departments.get(row["item_id"], "Other")
-            items.append(
-                {
-                    "id": row["item_id"],
-                    "name": row["item_name"],
-                    "department": department,
-                    "quantity": row["quantity"],
-                    "total": round(row["total"], 2),
-                }
-            )
-            entry = by_department.setdefault(
-                department, {"department": department, "quantity": 0, "total": 0}
-            )
-            entry["quantity"] += row["quantity"]
-            entry["total"] += row["total"]
-        for entry in by_department.values():
-            entry["total"] = round(entry["total"], 2)
-
-        return jsonify(
-            {
-                "start": start,
-                "end": end,
-                "overall": {
-                    "count": sum(t["count"] for t in by_tender.values()),
-                    "total": round(sum(t["total"] for t in by_tender.values()), 2),
-                },
-                "by_tender": by_tender,
-                "refunds": {"count": refunds["count"], "total": round(refunds["total"], 2)},
-                "by_day": list(by_day.values()),
-                "by_cashier": [
-                    {
-                        "cashier": row["cashier"],
-                        "count": row["count"],
-                        "refunds": round(row["refund_total"], 2),
-                        "total": round(row["total"], 2),
-                    }
-                    for row in cashier_rows
-                ],
-                "by_department": sorted(by_department.values(), key=lambda d: -d["total"]),
-                "items": items,
-            }
+    by_method = {}
+    by_day = {}
+    refunds = {"count": 0, "total_cents": 0}
+    discount = 0
+    for row in method_rows:
+        refunds["count"] += row["refund_count"]
+        refunds["total_cents"] += row["refund_cents"]
+        discount += row["discount_cents"]
+        method = by_method.setdefault(
+            row["payment_method_id"],
+            {"id": row["payment_method_id"], "label": row["label"], "count": 0, "total_cents": 0},
         )
-    except Exception:
-        logger.exception("Error building report")
-        return jsonify({"error": "Internal server error while building report"}), 500
+        method["count"] += row["count"]
+        method["total_cents"] += row["total_cents"]
+
+        day = by_day.setdefault(
+            row["sale_date"],
+            {"date": row["sale_date"].isoformat(), "count": 0, "total_cents": 0, "refund_cents": 0, "by_method": {}},
+        )
+        day["count"] += row["count"]
+        day["total_cents"] += row["total_cents"]
+        day["refund_cents"] += row["refund_cents"]
+        day["by_method"][row["payment_method_id"]] = row["total_cents"]
+
+    by_department = {}
+    for row in line_rows:
+        entry = by_department.setdefault(
+            row["department"], {"department": row["department"], "quantity": 0, "total_cents": 0}
+        )
+        entry["quantity"] += row["quantity"]
+        entry["total_cents"] += row["total_cents"]
+
+    return jsonify(
+        {
+            "start": start.isoformat() if start else None,
+            "end": end.isoformat() if end else None,
+            "overall": {
+                "count": sum(m["count"] for m in by_method.values()),
+                "total_cents": sum(m["total_cents"] for m in by_method.values()),
+                "discount_cents": discount,
+            },
+            "by_method": list(by_method.values()),
+            "refunds": refunds,
+            "by_day": list(by_day.values()),
+            "by_cashier": cashier_rows,
+            # Items at a charity drive, sellers at a yard sale
+            "lines": line_rows,
+            "by_department": sorted(by_department.values(), key=lambda d: -d["total_cents"])
+            if g.event["mode"] == "charity" else [],
+        }
+    )
+
+@app.route("/api/events/<int:event_id>/settlement", methods=["GET"])
+@event_route()
+def get_settlement(event_id):
+    """What each seller sold, who is holding the money, and who pays whom at the end."""
+    if g.event["mode"] != "yard_sale":
+        return jsonify({"error": "Settlement is only for yard sales"}), 400
+
+    with get_db_connection() as conn:
+        sellers = conn.execute(
+            "SELECT id, name, active FROM sellers WHERE event_id = %s ORDER BY id", (event_id,)
+        ).fetchall()
+        owed_rows = conn.execute(
+            """SELECT seller_id, SUM(final_cents)::bigint AS cents,
+                      SUM(quantity * list_cents - final_cents)::bigint AS discount_cents
+               FROM sale_lines WHERE event_id = %s GROUP BY seller_id""",
+            (event_id,),
+        ).fetchall()
+        held_rows = conn.execute(
+            """SELECT pm.id, pm.label, pm.holder_seller_id, COALESCE(SUM(s.total_cents), 0)::bigint AS cents
+               FROM payment_methods pm LEFT JOIN sales s ON s.payment_method_id = pm.id
+               WHERE pm.event_id = %s
+               GROUP BY pm.id ORDER BY pm.id""",
+            (event_id,),
+        ).fetchall()
+
+    owed = {row["seller_id"]: row["cents"] for row in owed_rows}
+    discounts = {row["seller_id"]: row["discount_cents"] for row in owed_rows}
+    held = {}
+    for row in held_rows:
+        held[row["holder_seller_id"]] = held.get(row["holder_seller_id"], 0) + row["cents"]
+
+    names = {seller["id"]: seller["name"] for seller in sellers}
+    names[CASH_BOX] = "Cash box"
+    transfers = settle(owed, held)
+    return jsonify(
+        {
+            "status": g.event["status"],
+            "sellers": [
+                {
+                    "id": seller["id"],
+                    "name": seller["name"],
+                    "sold_cents": owed.get(seller["id"], 0),
+                    "discount_cents": discounts.get(seller["id"], 0),
+                    "held_cents": held.get(seller["id"], 0),
+                }
+                for seller in sellers
+                if seller["active"] or seller["id"] in owed or seller["id"] in held
+            ],
+            "cash_box_cents": held.get(CASH_BOX, 0),
+            "payment_methods": [
+                {"id": row["id"], "label": row["label"], "holder_seller_id": row["holder_seller_id"], "total_cents": row["cents"]}
+                for row in held_rows
+            ],
+            "transfers": [
+                {"from_id": payer, "from": names[payer], "to_id": payee, "to": names[payee], "cents": cents}
+                for payer, payee, cents in transfers
+            ],
+        }
+    )
 
 # Serve frontend app (if built) for SPA routes
 @app.route("/", defaults={"path": ""})
@@ -927,7 +1118,12 @@ def serve_frontend(path):
         return send_from_directory(app.static_folder, "index.html")
     return send_from_directory(app.static_folder, path)
 
+# A cashier's login link. Flask's static route would otherwise answer it with a 404.
+@app.route("/e/<code>")
+def event_link(code):
+    return send_from_directory(app.static_folder, "index.html")
+
 if __name__ == "__main__":
     # Only used when running directly with python app.py
     port = int(os.environ.get("PORT", 5001))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)

@@ -1,6 +1,8 @@
 import { useState, useEffect } from "react";
+import { sendJson } from "./format";
 
-function Cashiers({ api }) {
+function Cashiers({ api, eventId }) {
+  const base = `/api/events/${eventId}/cashiers`;
   const [cashiers, setCashiers] = useState([]);
   const [error, setError] = useState("");
   const [newName, setNewName] = useState("");
@@ -8,7 +10,6 @@ function Cashiers({ api }) {
   const [editingId, setEditingId] = useState(null);
   const [editName, setEditName] = useState("");
   const [editPin, setEditPin] = useState("");
-  const [blocks, setBlocks] = useState([]);
 
   // Send a change to the server, then reload the list. Returns true if it worked.
   const request = async (path, options) => {
@@ -20,7 +21,7 @@ function Cashiers({ api }) {
         setError(result.error || "Something went wrong");
         return false;
       }
-      const list = await api("/api/cashiers");
+      const list = await api(base);
       setCashiers(await list.json());
       return true;
     } catch (error) {
@@ -30,26 +31,8 @@ function Cashiers({ api }) {
     }
   };
 
-  const sendJson = (method, body) => ({
-    method,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  const loadBlocks = async () => {
-    const response = await api("/api/login-blocks");
-    if (!response.ok) {
-      throw new Error(`Status ${response.status}`);
-    }
-    setBlocks(await response.json());
-  };
-
   useEffect(() => {
-    loadBlocks().catch((error) => {
-      console.error("Error:", error);
-      setError("Could not load blocked devices");
-    });
-    api("/api/cashiers")
+    api(base)
       .then((response) => {
         if (!response.ok) {
           throw new Error(`Status ${response.status}`);
@@ -63,12 +46,12 @@ function Cashiers({ api }) {
       });
     // api is recreated on every render, so it must not retrigger the request
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [eventId]);
 
   const addCashier = async (e) => {
     e.preventDefault();
     const added = await request(
-      "/api/cashiers",
+      base,
       sendJson("POST", { name: newName, pin: newPin }),
     );
     if (added) {
@@ -89,7 +72,7 @@ function Cashiers({ api }) {
     // A blank PIN keeps the current one
     const changes = editPin ? { name: editName, pin: editPin } : { name: editName };
     const saved = await request(
-      `/api/cashiers/${editingId}`,
+      `${base}/${editingId}`,
       sendJson("PUT", changes),
     );
     if (saved) {
@@ -103,25 +86,7 @@ function Cashiers({ api }) {
         `Remove ${cashier.name}? Their past sales will stay in the reports.`,
       )
     ) {
-      request(`/api/cashiers/${cashier.id}`, { method: "DELETE" });
-    }
-  };
-
-  const unblock = async (block) => {
-    setError("");
-    try {
-      const response = await api(
-        `/api/login-blocks/${encodeURIComponent(block.ip)}`,
-        { method: "DELETE" },
-      );
-      if (!response.ok && response.status !== 404) {
-        const result = await response.json();
-        setError(result.error || "Could not unblock that device");
-      }
-      await loadBlocks();
-    } catch (error) {
-      console.error("Error:", error);
-      setError("Error connecting to server");
+      request(`${base}/${cashier.id}`, { method: "DELETE" });
     }
   };
 
@@ -219,33 +184,6 @@ function Cashiers({ api }) {
         )}
       </section>
 
-      <section className="report-section">
-        <h3>Blocked Devices</h3>
-        <p className="report-note">
-          A device is blocked after 10 wrong codes in a row. Devices on a
-          private network are only locked out for 5 minutes.
-        </p>
-        {blocks.length === 0 && <p>No blocked devices</p>}
-        {blocks.map((block) => (
-          <div key={block.ip} className="cashier-row">
-            <div>
-              <span className="cashier-name">{block.ip}</span>
-              <div className="report-note">
-                {block.banned
-                  ? "Blocked"
-                  : `Locked until ${new Date(block.locked_until).toLocaleTimeString()}`}
-                , {block.failures} wrong codes, last{" "}
-                {new Date(block.last_failure).toLocaleString()}
-              </div>
-            </div>
-            <div className="cashier-actions">
-              <button className="tab-button" onClick={() => unblock(block)}>
-                Unblock
-              </button>
-            </div>
-          </div>
-        ))}
-      </section>
     </div>
   );
 }

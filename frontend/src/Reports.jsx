@@ -1,8 +1,9 @@
 import { useState, useEffect } from "react";
-import { TENDERS, capitalize, money, today } from "./format";
+import { money, today } from "./format";
 import { REFRESH_SECONDS, useAutoRefresh } from "./useAutoRefresh";
 
-function Reports({ api }) {
+function Reports({ api, event }) {
+  const yardSale = event.mode === "yard_sale";
   const [start, setStart] = useState(today);
   const [end, setEnd] = useState(today);
   const [report, setReport] = useState(null);
@@ -16,7 +17,7 @@ function Reports({ api }) {
     if (start) params.set("start", start);
     if (end) params.set("end", end);
 
-    api(`/api/reports/summary?${params}`)
+    api(`/api/events/${event.id}/report?${params}`)
       .then(async (response) => {
         const result = await response.json();
         if (ignore) return;
@@ -42,7 +43,7 @@ function Reports({ api }) {
     };
     // api is recreated on every render, so it must not retrigger the request
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [start, end, refreshTick]);
+  }, [event.id, start, end, refreshTick]);
 
   const showRange = (newStart, newEnd) => {
     setStart(newStart);
@@ -99,14 +100,18 @@ function Reports({ api }) {
 
       {report && (
         <>
-          <h2>Sales Report: {rangeLabel()}</h2>
+          <h2>
+            {event.name}: {rangeLabel()}
+          </h2>
           <p className="report-overall">
-            {money(report.overall.total)} from {report.overall.count}{" "}
+            {money(report.overall.total_cents)} from {report.overall.count}{" "}
             {report.overall.count === 1 ? "sale" : "sales"}
             {report.refunds.count > 0 &&
               `, after ${report.refunds.count} ${
                 report.refunds.count === 1 ? "refund" : "refunds"
-              } (${money(report.refunds.total)})`}
+              } (${money(report.refunds.total_cents)})`}
+            {report.overall.discount_cents > 0 &&
+              `. Offers took ${money(report.overall.discount_cents)} off.`}
           </p>
 
           <section className="report-section">
@@ -119,9 +124,9 @@ function Reports({ api }) {
                 <tr>
                   <th>Date</th>
                   <th className="num">Sales</th>
-                  {TENDERS.map((tender) => (
-                    <th key={tender} className="num">
-                      {capitalize(tender)}
+                  {report.by_method.map((method) => (
+                    <th key={method.id} className="num">
+                      {method.label}
                     </th>
                   ))}
                   <th className="num">Refunds</th>
@@ -133,18 +138,18 @@ function Reports({ api }) {
                   <tr key={day.date}>
                     <td>{day.date}</td>
                     <td className="num">{day.count}</td>
-                    {TENDERS.map((tender) => (
-                      <td key={tender} className="num">
-                        {money(day.tenders[tender])}
+                    {report.by_method.map((method) => (
+                      <td key={method.id} className="num">
+                        {money(day.by_method[method.id] ?? 0)}
                       </td>
                     ))}
-                    <td className="num">{money(day.refunds)}</td>
-                    <td className="num">{money(day.total)}</td>
+                    <td className="num">{money(day.refund_cents)}</td>
+                    <td className="num">{money(day.total_cents)}</td>
                   </tr>
                 ))}
                 {report.by_day.length === 0 && (
                   <tr>
-                    <td colSpan={TENDERS.length + 4}>No sales in this period</td>
+                    <td colSpan={report.by_method.length + 4}>No sales in this period</td>
                   </tr>
                 )}
               </tbody>
@@ -152,39 +157,15 @@ function Reports({ api }) {
                 <tr>
                   <td>Total</td>
                   <td className="num">{report.overall.count}</td>
-                  {TENDERS.map((tender) => (
-                    <td key={tender} className="num">
-                      {money(report.by_tender[tender].total)}
+                  {report.by_method.map((method) => (
+                    <td key={method.id} className="num">
+                      {money(method.total_cents)}
                     </td>
                   ))}
-                  <td className="num">{money(report.refunds.total)}</td>
-                  <td className="num">{money(report.overall.total)}</td>
+                  <td className="num">{money(report.refunds.total_cents)}</td>
+                  <td className="num">{money(report.overall.total_cents)}</td>
                 </tr>
               </tfoot>
-            </table>
-          </section>
-
-          <section className="report-section">
-            <h3>Payment Method Totals</h3>
-            <table className="report-table">
-              <thead>
-                <tr>
-                  <th>Payment Method</th>
-                  <th className="num">Sales</th>
-                  <th className="num">Total</th>
-                </tr>
-              </thead>
-              <tbody>
-                {TENDERS.map((tender) => (
-                  <tr key={tender}>
-                    <td>{capitalize(tender)}</td>
-                    <td className="num">{report.by_tender[tender].count}</td>
-                    <td className="num">
-                      {money(report.by_tender[tender].total)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
             </table>
           </section>
 
@@ -204,8 +185,8 @@ function Reports({ api }) {
                   <tr key={cashier.cashier}>
                     <td>{cashier.cashier}</td>
                     <td className="num">{cashier.count}</td>
-                    <td className="num">{money(cashier.refunds)}</td>
-                    <td className="num">{money(cashier.total)}</td>
+                    <td className="num">{money(cashier.refund_cents)}</td>
+                    <td className="num">{money(cashier.total_cents)}</td>
                   </tr>
                 ))}
                 {report.by_cashier.length === 0 && (
@@ -217,54 +198,64 @@ function Reports({ api }) {
             </table>
           </section>
 
-          <section className="report-section">
-            <h3>Department Totals</h3>
-            <table className="report-table">
-              <thead>
-                <tr>
-                  <th>Department</th>
-                  <th className="num">Quantity</th>
-                  <th className="num">Total</th>
-                </tr>
-              </thead>
-              <tbody>
-                {report.by_department.map((department) => (
-                  <tr key={department.department}>
-                    <td>{department.department}</td>
-                    <td className="num">{department.quantity}</td>
-                    <td className="num">{money(department.total)}</td>
-                  </tr>
-                ))}
-                {report.by_department.length === 0 && (
+          {!yardSale && (
+            <section className="report-section">
+              <h3>Department Totals</h3>
+              <table className="report-table">
+                <thead>
                   <tr>
-                    <td colSpan="3">No sales in this period</td>
+                    <th>Department</th>
+                    <th className="num">Quantity</th>
+                    <th className="num">Total</th>
                   </tr>
-                )}
-              </tbody>
-            </table>
-          </section>
+                </thead>
+                <tbody>
+                  {report.by_department.map((department) => (
+                    <tr key={department.department}>
+                      <td>{department.department || "None"}</td>
+                      <td className="num">{department.quantity}</td>
+                      <td className="num">{money(department.total_cents)}</td>
+                    </tr>
+                  ))}
+                  {report.by_department.length === 0 && (
+                    <tr>
+                      <td colSpan="3">No sales in this period</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </section>
+          )}
 
           <section className="report-section">
-            <h3>Single Item Totals</h3>
+            <h3>{yardSale ? "Seller Totals" : "Single Item Totals"}</h3>
+            {yardSale && (
+              <p className="report-note">
+                Totals are after each seller's share of any offers. See Payouts
+                for who pays whom.
+              </p>
+            )}
             <table className="report-table">
               <thead>
                 <tr>
-                  <th>Item</th>
-                  <th>Department</th>
+                  <th>{yardSale ? "Seller" : "Item"}</th>
+                  {!yardSale && <th>Department</th>}
                   <th className="num">Quantity</th>
+                  {yardSale && <th className="num">Asking</th>}
                   <th className="num">Total</th>
                 </tr>
               </thead>
               <tbody>
-                {report.items.map((item) => (
-                  <tr key={`${item.id}-${item.name}`}>
-                    <td>{item.name}</td>
-                    <td>{item.department}</td>
-                    <td className="num">{item.quantity}</td>
-                    <td className="num">{money(item.total)}</td>
+                {report.lines.map((line) => (
+                  <tr key={line.id}>
+                    <td>{line.name}</td>
+                    {!yardSale && <td>{line.department}</td>}
+                    <td className="num">{line.quantity}</td>
+                    {yardSale && <td className="num">{money(line.list_cents)}</td>}
+                    <td className="num">{money(line.total_cents)}</td>
                   </tr>
                 ))}
-                {report.items.length === 0 && (
+                {report.lines.length === 0 && (
                   <tr>
                     <td colSpan="4">No sales in this period</td>
                   </tr>

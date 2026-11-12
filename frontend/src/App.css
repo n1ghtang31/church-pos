@@ -184,6 +184,27 @@
   color: #2c5f2d;
 }
 
+.cart-total .cashier-actions {
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+/* Each seller's share of an offer */
+.offer-split {
+  margin: 10px 0 0;
+  padding-left: 20px;
+  text-align: right;
+  list-style: none;
+}
+
+.line-note {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px;
+  margin-bottom: 15px;
+  font-size: 16px;
+}
+
 .tender-section {
   background: white;
   padding: 15px;
