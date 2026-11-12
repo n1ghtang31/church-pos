@@ -2,6 +2,21 @@
 # a Church POS install on the same machine
 name: sale-pos
 
+# Settings shared by the web app and the daily purge
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql://pos:${POSTGRES_PASSWORD}@db:5432/pos
+  SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+  PUBLIC_URL: ${PUBLIC_URL:?Set PUBLIC_URL in .env}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
+  POS_TIMEZONE: ${POS_TIMEZONE:-America/Chicago}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_SECURITY: ${SMTP_SECURITY:-starttls}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_FROM: ${SMTP_FROM:-}
+
 services:
   db:
     image: postgres:17-alpine
@@ -25,13 +40,19 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    environment:
-      - DATABASE_URL=postgresql://pos:${POSTGRES_PASSWORD}@db:5432/pos
-      - ADMIN_CODE=${ADMIN_CODE:?Set ADMIN_CODE in .env}
-      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env}
-      - COOKIE_SECURE=${COOKIE_SECURE:-false}
-      - TRUSTED_PROXY_IPS=${TRUSTED_PROXY_IPS:-}
-      - POS_TIMEZONE=${POS_TIMEZONE:-America/Chicago}
+    environment: *app-environment
+    restart: unless-stopped
+
+  # Once a day: close events idle for 60 days, and delete events 6 months after they close
+  purger:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment: *app-environment
+    command: ["sh", "-c", "while true; do flask --app app purge-expired; sleep 86400; done"]
+    healthcheck:
+      disable: true
     restart: unless-stopped
 
 volumes:

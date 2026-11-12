@@ -2,6 +2,87 @@ import { useState, useEffect } from "react";
 import { money } from "./format";
 import { REFRESH_SECONDS, useAutoRefresh } from "./useAutoRefresh";
 
+export function SettlementTables({ result, name }) {
+  return (
+    <>
+      <h2>Who Pays Whom: {name}</h2>
+      {result.status === "open" && (
+        <p className="report-note">
+          The sale is still open, so these amounts will change with each sale.
+        </p>
+      )}
+
+      <section className="report-section">
+        <h3>Payouts</h3>
+        {result.transfers.length === 0 ? (
+          <p>Everyone already has what they're owed.</p>
+        ) : (
+          <table className="report-table">
+            <tbody>
+              {result.transfers.map((transfer, index) => (
+                <tr key={index}>
+                  <td>
+                    <strong>{transfer.from}</strong> pays <strong>{transfer.to}</strong>
+                  </td>
+                  <td className="num">{money(transfer.cents)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section className="report-section">
+        <h3>Sellers</h3>
+        <p className="report-note">
+          Sold is after offers and refunds. Holding is money paid into that
+          person's own account, such as their Venmo.
+        </p>
+        <table className="report-table">
+          <thead>
+            <tr>
+              <th>Seller</th>
+              <th className="num">Sold</th>
+              <th className="num">Given Off</th>
+              <th className="num">Holding</th>
+            </tr>
+          </thead>
+          <tbody>
+            {result.sellers.map((seller) => (
+              <tr key={seller.id}>
+                <td>{seller.name}</td>
+                <td className="num">{money(seller.sold_cents)}</td>
+                <td className="num">{money(seller.discount_cents)}</td>
+                <td className="num">{money(seller.held_cents)}</td>
+              </tr>
+            ))}
+            <tr>
+              <td>Cash box</td>
+              <td></td>
+              <td></td>
+              <td className="num">{money(result.cash_box_cents)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section className="report-section">
+        <h3>Payment Methods</h3>
+        <table className="report-table">
+          <tbody>
+            {result.payment_methods.map((method) => (
+              <tr key={method.id}>
+                <td>{method.label}</td>
+                <td className="num">{money(method.total_cents)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+    </>
+  );
+}
+
 function Settlement({ api, event }) {
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
@@ -50,84 +131,7 @@ function Settlement({ api, event }) {
         </p>
       )}
 
-      {result && (
-        <>
-          <h2>Who Pays Whom: {event.name}</h2>
-          {result.status === "open" && (
-            <p className="report-note">
-              The sale is still open, so these amounts will change with each sale.
-            </p>
-          )}
-
-          <section className="report-section">
-            <h3>Payouts</h3>
-            {result.transfers.length === 0 ? (
-              <p>Everyone already has what they're owed.</p>
-            ) : (
-              <table className="report-table">
-                <tbody>
-                  {result.transfers.map((transfer, index) => (
-                    <tr key={index}>
-                      <td>
-                        <strong>{transfer.from}</strong> pays <strong>{transfer.to}</strong>
-                      </td>
-                      <td className="num">{money(transfer.cents)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </section>
-
-          <section className="report-section">
-            <h3>Sellers</h3>
-            <p className="report-note">
-              Sold is after offers and refunds. Holding is money paid into that
-              person's own account, such as their Venmo.
-            </p>
-            <table className="report-table">
-              <thead>
-                <tr>
-                  <th>Seller</th>
-                  <th className="num">Sold</th>
-                  <th className="num">Given Off</th>
-                  <th className="num">Holding</th>
-                </tr>
-              </thead>
-              <tbody>
-                {result.sellers.map((seller) => (
-                  <tr key={seller.id}>
-                    <td>{seller.name}</td>
-                    <td className="num">{money(seller.sold_cents)}</td>
-                    <td className="num">{money(seller.discount_cents)}</td>
-                    <td className="num">{money(seller.held_cents)}</td>
-                  </tr>
-                ))}
-                <tr>
-                  <td>Cash box</td>
-                  <td></td>
-                  <td></td>
-                  <td className="num">{money(result.cash_box_cents)}</td>
-                </tr>
-              </tbody>
-            </table>
-          </section>
-
-          <section className="report-section">
-            <h3>Payment Methods</h3>
-            <table className="report-table">
-              <tbody>
-                {result.payment_methods.map((method) => (
-                  <tr key={method.id}>
-                    <td>{method.label}</td>
-                    <td className="num">{money(method.total_cents)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </section>
-        </>
-      )}
+      {result && <SettlementTables result={result} name={event.name} />}
     </div>
   );
 }

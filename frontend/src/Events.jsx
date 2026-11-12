@@ -1,8 +1,7 @@
 import { useState, useEffect } from "react";
-import BlockedDevices from "./BlockedDevices";
 import { MODE_LABELS, sendJson } from "./format";
 
-function Events({ api, onOpen }) {
+function Events({ api, onOpen, showOwner }) {
   const [events, setEvents] = useState([]);
   const [error, setError] = useState("");
   const [name, setName] = useState("");
@@ -82,6 +81,7 @@ function Events({ api, onOpen }) {
                 {MODE_LABELS[event.mode]}, code {event.code},{" "}
                 {event.status === "open" ? "open" : "closed"}, created{" "}
                 {new Date(event.created_at).toLocaleDateString()}
+                {showOwner && `, ${event.owner_email ?? "no owner"}`}
               </div>
             </div>
             <div className="cashier-actions">
@@ -92,8 +92,6 @@ function Events({ api, onOpen }) {
           </div>
         ))}
       </section>
-
-      <BlockedDevices api={api} />
     </div>
   );
 }

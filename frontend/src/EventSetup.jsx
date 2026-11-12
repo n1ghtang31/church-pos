@@ -66,7 +66,7 @@ function EventSetup({ api, event, onChanged, onDeleted }) {
   const setStatus = (action) => {
     const warning =
       action === "close"
-        ? "Close this event? Cashiers won't be able to ring up sales or refunds until it's reopened."
+        ? "Close this event? Cashiers can't ring up sales or refunds until it's reopened. You'll get the final report by email, and the event and its sales will be deleted 6 months from now."
         : "Reopen this event for sales?";
     if (window.confirm(warning)) {
       request(`${base}/${action}`, { method: "POST" });
@@ -106,7 +106,21 @@ function EventSetup({ api, event, onChanged, onDeleted }) {
           {MODE_LABELS[event.mode]}. Cashiers log in at <strong>{link}</strong> (event
           code {event.code}).
         </p>
+        {event.purge_after && (
+          <p className="report-note">
+            Closed. This event and every sale in it will be permanently deleted on{" "}
+            {new Date(event.purge_after).toLocaleDateString()}. Download a copy to keep it.
+          </p>
+        )}
         <div className="cashier-actions">
+          <a className="tab-button" href={`${base}/sales.csv`}>
+            Download Sales CSV
+          </a>
+          {yardSale && (
+            <a className="tab-button" href={`${base}/payouts.csv`}>
+              Download Payouts CSV
+            </a>
+          )}
           {event.status === "open" ? (
             <button className="tab-button" onClick={() => setStatus("close")}>
               Close Event

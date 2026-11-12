@@ -11,12 +11,18 @@ from functools import wraps
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import csv
+import io
+
 import click
 import psycopg
-from flask import Flask, g, jsonify, request, send_from_directory, session
+from flask import Flask, Response, g, jsonify, request, send_from_directory, session
+from itsdangerous import BadSignature, URLSafeSerializer
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+from werkzeug.security import check_password_hash, generate_password_hash
 
+from pos import mail
 from pos.money import CASH_BOX, allocate_discount, settle
 
 # Configure logging
@@ -28,13 +34,13 @@ static_dir = os.environ.get("FLASK_STATIC_DIR", "frontend_build")
 app = Flask(__name__, static_folder=static_dir, static_url_path="/")
 
 # Refuse to start without credentials rather than run with the API open
-ADMIN_CODE = os.environ.get("ADMIN_CODE")
 SECRET_KEY = os.environ.get("SECRET_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-if not ADMIN_CODE or not SECRET_KEY or not DATABASE_URL:
-    raise RuntimeError("ADMIN_CODE, SECRET_KEY and DATABASE_URL environment variables must be set")
-if not re.fullmatch(r"[A-Za-z0-9]{8,32}", ADMIN_CODE):
-    raise RuntimeError("ADMIN_CODE must be 8 to 32 letters or digits")
+if not SECRET_KEY or not DATABASE_URL:
+    raise RuntimeError("SECRET_KEY and DATABASE_URL environment variables must be set")
+
+# The address people use to reach the site, for links in emails
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:5000").rstrip("/")
 
 # New events use this time zone, which decides which day a sale counts toward in reports
 DEFAULT_TIMEZONE = os.environ.get("POS_TIMEZONE", "America/Chicago")
@@ -55,7 +61,11 @@ app.config.update(
     MAX_CONTENT_LENGTH=64 * 1024,
 )
 
-PUBLIC_API_PATHS = {"/api/login", "/api/session", "/api/health"}
+PUBLIC_API_PATHS = {"/api/login", "/api/session", "/api/health", "/api/password-reset"}
+# Anyone holding one of these emailed links may use it without logging in
+PUBLIC_API_PREFIXES = ("/api/password-reset/", "/api/invites/accept/", "/api/shared/")
+# Only the site owner may use these
+OWNER_API_PREFIXES = ("/api/login-blocks", "/api/invites", "/api/users")
 
 # After this many wrong codes in a row from one address, a public address is banned
 # until the admin unblocks it. A private address only gets a short lockout, because it
@@ -80,7 +90,18 @@ MAX_QUANTITY = 999
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_LENGTH = 6
 
+MIN_PASSWORD_LENGTH = 10
+INVITE_LIFETIME = timedelta(days=7)
+RESET_LIFETIME = timedelta(hours=1)
+# A closed event and everything in it is deleted this long after it closes
+RETENTION = "6 months"
+# An open event with no sales for this long is closed for the organizer
+IDLE_CLOSE = "60 days"
+
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+# Signs the report links emailed when an event closes
+shared_links = URLSafeSerializer(SECRET_KEY, salt="shared-report")
 
 pool = ConnectionPool(
     DATABASE_URL, min_size=1, max_size=10, kwargs={"row_factory": dict_row}, open=True
@@ -196,11 +217,54 @@ def hash_pin(event_id, pin):
     # Changing SECRET_KEY invalidates every PIN.
     return hmac.new(SECRET_KEY.encode(), f"{event_id}:{pin}".encode(), hashlib.sha256).hexdigest()
 
+def clean_email(value):
+    if not isinstance(value, str) or len(value.strip()) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value.strip()):
+        raise ValueError("Enter a valid email address")
+    return value.strip().lower()
+
+def clean_password(value):
+    if not isinstance(value, str) or not MIN_PASSWORD_LENGTH <= len(value) <= 200:
+        raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters")
+    return value
+
+def create_user(email, name, password, is_owner=False):
+    """Add an organizer account and return its id."""
+    with get_db_connection() as conn:
+        return conn.execute(
+            "INSERT INTO users (email, name, password_hash, is_owner) VALUES (%s, %s, %s, %s) RETURNING id",
+            (clean_email(email), clean_text(name, "Name"), generate_password_hash(clean_password(password)), is_owner),
+        ).fetchone()["id"]
+
+def password_tag(password_hash):
+    # Kept in the session, so changing a password logs out every other session for that account
+    return hmac.new(SECRET_KEY.encode(), password_hash.encode(), hashlib.sha256).hexdigest()[:16]
+
+def new_token():
+    """An emailed one-time token, and the hash of it that's stored."""
+    token = secrets.token_urlsafe(32)
+    return token, hash_token(token)
+
+def hash_token(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
 def current_user():
-    """Return the logged in user as {"role", "name"} (plus "event_id" for a cashier), or None."""
+    """Return the logged in user, or None.
+
+    An organizer has "user_id", "email" and "is_owner". A cashier has "event_id".
+    """
     role = session.get("role")
-    if role == "admin":
-        return {"role": "admin", "name": "Admin"}
+    if role == "organizer":
+        with get_db_connection() as conn:
+            user = conn.execute("SELECT * FROM users WHERE id = %s", (session.get("user_id"),)).fetchone()
+        if user and hmac.compare_digest(session.get("password_tag", ""), password_tag(user["password_hash"])):
+            return {
+                "role": "organizer",
+                "user_id": user["id"],
+                "name": user["name"],
+                "email": user["email"],
+                "is_owner": user["is_owner"],
+            }
+        session.clear()
     if role == "cashier":
         with get_db_connection() as conn:
             cashier = conn.execute(
@@ -229,40 +293,56 @@ def add_security_headers(response):
 
 @app.before_request
 def require_login():
-    if not request.path.startswith("/api/") or request.path in PUBLIC_API_PATHS:
+    if (
+        not request.path.startswith("/api/")
+        or request.path in PUBLIC_API_PATHS
+        or request.path.startswith(PUBLIC_API_PREFIXES)
+    ):
         return None
 
     g.user = current_user()
     if not g.user:
         return jsonify({"error": "Authentication required"}), 401
-    if request.path.startswith("/api/login-blocks") and g.user["role"] != "admin":
-        return jsonify({"error": "Admin access required"}), 403
+    if request.path.startswith(OWNER_API_PREFIXES) and not g.user.get("is_owner"):
+        return jsonify({"error": "Only the site owner can do that"}), 403
     return None
 
-def admin_only(view):
+def organizer_only(view):
     @wraps(view)
     def wrapper(*args, **kwargs):
-        if g.user["role"] != "admin":
-            return jsonify({"error": "Admin access required"}), 403
+        if g.user["role"] != "organizer":
+            return jsonify({"error": "Organizer access required"}), 403
         return view(*args, **kwargs)
     return wrapper
 
-def event_route(admin=False):
+def load_event(conn, event_id):
+    return conn.execute(
+        """SELECT e.*, u.email AS owner_email FROM events e
+           LEFT JOIN users u ON u.id = e.owner_user_id WHERE e.id = %s""",
+        (event_id,),
+    ).fetchone()
+
+def event_route(manage=False):
     """Load the event in the URL into g.event, if this user may see it.
 
-    A cashier only ever sees their own event. Any other event looks like it doesn't
-    exist, so cashiers can't find out which events are on the site.
+    A cashier only sees their own event, and an organizer only the events they made,
+    unless they're the site owner. Any other event looks like it doesn't exist, so no
+    one can find out which events are on the site. manage=True keeps cashiers out.
     """
     def decorator(view):
         @wraps(view)
         def wrapper(event_id, *args, **kwargs):
             if g.user["role"] == "cashier" and g.user["event_id"] != event_id:
                 return jsonify({"error": "Event not found"}), 404
-            if admin and g.user["role"] != "admin":
-                return jsonify({"error": "Admin access required"}), 403
+            if manage and g.user["role"] != "organizer":
+                return jsonify({"error": "Organizer access required"}), 403
             with get_db_connection() as conn:
-                g.event = conn.execute("SELECT * FROM events WHERE id = %s", (event_id,)).fetchone()
-            if not g.event:
+                g.event = load_event(conn, event_id)
+            if not g.event or (
+                g.user["role"] == "organizer"
+                and not g.user["is_owner"]
+                and g.event["owner_user_id"] != g.user["user_id"]
+            ):
                 return jsonify({"error": "Event not found"}), 404
             return view(event_id, *args, **kwargs)
         return wrapper
@@ -291,9 +371,12 @@ def get_session():
     user = current_user()
     return jsonify({"authenticated": bool(user), **(user or {})})
 
+# Checked when an email isn't found, so a wrong email takes as long as a wrong password
+DUMMY_PASSWORD_HASH = generate_password_hash("not-a-real-password")
+
 @app.route("/api/login", methods=["POST"])
 def login():
-    """Log in with the admin code, or with an event code and a cashier PIN."""
+    """Log in with an email and password, or with an event code and a cashier PIN."""
     ip = client_ip()
     with get_db_connection() as conn:
         block = login_block(conn, ip)
@@ -306,13 +389,23 @@ def login():
         data = {}
     code = data.get("code")
     event_code = data.get("event_code")
+    email = data.get("email")
+    password = data.get("password")
 
     role = None
     cashier = None
-    if isinstance(code, str):
-        if hmac.compare_digest(code.encode(), ADMIN_CODE.encode()):
-            role = "admin"
-        elif isinstance(event_code, str):
+    user = None
+    if isinstance(email, str) and isinstance(password, str):
+        with get_db_connection() as conn:
+            user = conn.execute(
+                "SELECT id, password_hash FROM users WHERE email = %s", (email.strip().lower(),)
+            ).fetchone()
+        if check_password_hash(user["password_hash"] if user else DUMMY_PASSWORD_HASH, password) and user:
+            role = "organizer"
+        else:
+            user = None
+    elif isinstance(code, str):
+        if isinstance(event_code, str):
             with get_db_connection() as conn:
                 event = conn.execute(
                     "SELECT id FROM events WHERE code = %s", (event_code.strip().upper(),)
@@ -337,13 +430,18 @@ def login():
     # A correct code clears the count, so occasional typos never add up to a ban
     with get_db_connection() as conn:
         conn.execute("DELETE FROM login_failures WHERE ip = %s", (ip,))
+    start_session(role, user=user, cashier=cashier)
+    return jsonify({"authenticated": True, **current_user()})
+
+def start_session(role, user=None, cashier=None):
     session.clear()
     session.permanent = True
     session["role"] = role
+    if user:
+        session["user_id"] = user["id"]
+        session["password_tag"] = password_tag(user["password_hash"])
     if cashier:
         session["cashier_id"] = cashier["id"]
-    user = current_user()
-    return jsonify({"authenticated": True, **user})
 
 @app.route("/api/logout", methods=["POST"])
 def logout():
@@ -447,19 +545,29 @@ def event_json(event):
         "timezone": event["timezone"],
         "created_at": iso(event["created_at"]),
         "closed_at": iso(event["closed_at"]),
+        "purge_after": iso(event["purge_after"]),
+        "owner_email": event.get("owner_email"),
     }
 
 @app.route("/api/events", methods=["GET"])
 def list_events():
+    if g.user["role"] == "cashier":
+        where, params = "e.id = %s", (g.user["event_id"],)
+    elif g.user["is_owner"]:
+        where, params = "TRUE", ()
+    else:
+        where, params = "e.owner_user_id = %s", (g.user["user_id"],)
     with get_db_connection() as conn:
-        if g.user["role"] == "admin":
-            rows = conn.execute("SELECT * FROM events ORDER BY created_at DESC").fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM events WHERE id = %s", (g.user["event_id"],)).fetchall()
+        rows = conn.execute(
+            f"""SELECT e.*, u.email AS owner_email FROM events e
+                LEFT JOIN users u ON u.id = e.owner_user_id
+                WHERE {where} ORDER BY e.created_at DESC""",
+            params,
+        ).fetchall()
     return jsonify([event_json(row) for row in rows])
 
 @app.route("/api/events", methods=["POST"])
-@admin_only
+@organizer_only
 def create_event():
     data = request.get_json(silent=True) or {}
     try:
@@ -471,15 +579,17 @@ def create_event():
         return jsonify({"error": str(e)}), 400
 
     with get_db_connection() as conn:
-        event = conn.execute(
-            "INSERT INTO events (code, name, mode, timezone) VALUES (%s, %s, %s, %s) RETURNING *",
-            (new_event_code(conn), name, data["mode"], timezone),
-        ).fetchone()
+        event_id = conn.execute(
+            """INSERT INTO events (code, name, mode, timezone, owner_user_id)
+               VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+            (new_event_code(conn), name, data["mode"], timezone, g.user["user_id"]),
+        ).fetchone()["id"]
         for label, kind in DEFAULT_PAYMENT_METHODS[data["mode"]]:
             conn.execute(
                 "INSERT INTO payment_methods (event_id, label, kind) VALUES (%s, %s, %s)",
-                (event["id"], label, kind),
+                (event_id, label, kind),
             )
+        event = load_event(conn, event_id)
     return jsonify(event_json(event)), 201
 
 def event_setup(conn, event_id):
@@ -505,7 +615,7 @@ def get_event(event_id):
     return jsonify({**event_json(g.event), **setup})
 
 @app.route("/api/events/<int:event_id>", methods=["PUT"])
-@event_route(admin=True)
+@event_route(manage=True)
 def update_event(event_id):
     data = request.get_json(silent=True) or {}
     try:
@@ -514,39 +624,56 @@ def update_event(event_id):
     except (ValueError, AttributeError) as e:
         return jsonify({"error": str(e)}), 400
     with get_db_connection() as conn:
-        event = conn.execute(
-            "UPDATE events SET name = %s, timezone = %s WHERE id = %s RETURNING *",
-            (name, timezone, event_id),
-        ).fetchone()
+        conn.execute(
+            "UPDATE events SET name = %s, timezone = %s WHERE id = %s", (name, timezone, event_id)
+        )
+        event = load_event(conn, event_id)
     return jsonify(event_json(event))
 
 @app.route("/api/events/<int:event_id>", methods=["DELETE"])
-@event_route(admin=True)
+@event_route(manage=True)
 def delete_event(event_id):
     with get_db_connection() as conn:
         conn.execute("DELETE FROM events WHERE id = %s", (event_id,))
-    logger.warning("Admin deleted event %s (%s)", event_id, g.event["name"])
+    logger.warning("%s deleted event %s (%s)", g.user["email"], event_id, g.event["name"])
     return "", 204
 
-@app.route("/api/events/<int:event_id>/close", methods=["POST"])
-@event_route(admin=True)
-def close_event(event_id):
+def close_and_notify(event_id):
+    """Close an open event, start its retention clock, and email its organizer.
+
+    Returns the event. Closing an event that's already closed changes nothing.
+    """
     with get_db_connection() as conn:
-        event = conn.execute(
-            """UPDATE events SET status = 'closed', closed_at = COALESCE(closed_at, now())
-               WHERE id = %s RETURNING *""",
+        closed = conn.execute(
+            f"""UPDATE events SET status = 'closed', closed_at = now(),
+                       purge_after = now() + interval '{RETENTION}'
+                WHERE id = %s AND status = 'open' RETURNING id""",
             (event_id,),
         ).fetchone()
-    return jsonify(event_json(event))
+        event = load_event(conn, event_id)
+    if closed and event["owner_email"]:
+        # The event is closed either way. If the email fails, the organizer can still
+        # download everything from the event's Reports.
+        try:
+            send_close_email(event)
+        except Exception:
+            logger.exception("Could not send the closing email for event %s", event_id)
+    return event
+
+@app.route("/api/events/<int:event_id>/close", methods=["POST"])
+@event_route(manage=True)
+def close_event(event_id):
+    return jsonify(event_json(close_and_notify(event_id)))
 
 @app.route("/api/events/<int:event_id>/reopen", methods=["POST"])
-@event_route(admin=True)
+@event_route(manage=True)
 def reopen_event(event_id):
     with get_db_connection() as conn:
-        event = conn.execute(
-            "UPDATE events SET status = 'open', closed_at = NULL WHERE id = %s RETURNING *",
+        conn.execute(
+            "UPDATE events SET status = 'open', closed_at = NULL, purge_after = NULL WHERE id = %s",
             (event_id,),
-        ).fetchone()
+        )
+        event = load_event(conn, event_id)
     return jsonify(event_json(event))
 
 # ----- Items, sellers and payment methods -----
@@ -589,7 +716,7 @@ SETUP_KINDS = {
 }
 
 @app.route("/api/events/<int:event_id>/<kind>", methods=["POST"])
-@event_route(admin=True)
+@event_route(manage=True)
 def create_setup_row(event_id, kind):
     if kind not in SETUP_KINDS:
         return jsonify({"error": "Not found"}), 404
@@ -609,7 +736,7 @@ def create_setup_row(event_id, kind):
     return jsonify(row), 201
 
 @app.route("/api/events/<int:event_id>/<kind>/<int:row_id>", methods=["PUT"])
-@event_route(admin=True)
+@event_route(manage=True)
 def update_setup_row(event_id, kind, row_id):
     if kind not in SETUP_KINDS:
         return jsonify({"error": "Not found"}), 404
@@ -630,7 +757,7 @@ def update_setup_row(event_id, kind, row_id):
     return jsonify(row)
 
 @app.route("/api/events/<int:event_id>/<kind>/<int:row_id>", methods=["DELETE"])
-@event_route(admin=True)
+@event_route(manage=True)
 def delete_setup_row(event_id, kind, row_id):
     if kind not in SETUP_KINDS:
         return jsonify({"error": "Not found"}), 404
@@ -659,8 +786,6 @@ def delete_setup_row(event_id, kind, row_id):
 def clean_cashier_pin(pin):
     if not isinstance(pin, str) or not re.fullmatch(r"[0-9]{4,8}", pin):
         raise ValueError("PIN must be 4 to 8 digits")
-    if hmac.compare_digest(pin.encode(), ADMIN_CODE.encode()):
-        raise ValueError("That PIN is not available")
     return pin
 
 def cashier_conflict_message(error):
@@ -669,7 +794,7 @@ def cashier_conflict_message(error):
     return "That PIN is not available"
 
 @app.route("/api/events/<int:event_id>/cashiers", methods=["GET"])
-@event_route(admin=True)
+@event_route(manage=True)
 def get_cashiers(event_id):
     with get_db_connection() as conn:
         rows = conn.execute(
@@ -678,7 +803,7 @@ def get_cashiers(event_id):
     return jsonify(rows)
 
 @app.route("/api/events/<int:event_id>/cashiers", methods=["POST"])
-@event_route(admin=True)
+@event_route(manage=True)
 def create_cashier(event_id):
     data = request.get_json(silent=True) or {}
     try:
@@ -697,7 +822,7 @@ def create_cashier(event_id):
     return jsonify(row), 201
 
 @app.route("/api/events/<int:event_id>/cashiers/<int:cashier_id>", methods=["PUT"])
-@event_route(admin=True)
+@event_route(manage=True)
 def update_cashier(event_id, cashier_id):
     """Rename a cashier and/or set a new PIN. Leave pin out to keep the current one."""
     data = request.get_json(silent=True) or {}
@@ -721,7 +846,7 @@ def update_cashier(event_id, cashier_id):
     return jsonify(row)
 
 @app.route("/api/events/<int:event_id>/cashiers/<int:cashier_id>", methods=["DELETE"])
-@event_route(admin=True)
+@event_route(manage=True)
 def delete_cashier(event_id, cashier_id):
     with get_db_connection() as conn:
         cursor = conn.execute(
@@ -882,11 +1007,8 @@ def parse_report_date(value):
         return None
     return date.fromisoformat(value)
 
-def date_range_filter():
-    """Read optional start/end args. Returns (start, end, where_sql, params) for the alias s.
-
-    Days are counted in the event's time zone.
-    """
+def report_dates():
+    """Read optional start/end args as dates, or raise ValueError."""
     try:
         start = parse_report_date(request.args.get("start"))
         end = parse_report_date(request.args.get("end"))
@@ -894,22 +1016,28 @@ def date_range_filter():
         raise ValueError("Dates must be in YYYY-MM-DD format") from None
     if start and end and start > end:
         raise ValueError("Start date must not be after end date")
+    return start, end
 
+def sales_filter(event, start=None, end=None):
+    """WHERE clause and params for the event's sales (alias s) from start to end.
+
+    Days are counted in the event's time zone.
+    """
     where = ["s.event_id = %s"]
-    params = [g.event["id"]]
+    params = [event["id"]]
     if start:
         where.append("(s.created_at AT TIME ZONE %s)::date >= %s")
-        params += [g.event["timezone"], start]
+        params += [event["timezone"], start]
     if end:
         where.append("(s.created_at AT TIME ZONE %s)::date <= %s")
-        params += [g.event["timezone"], end]
-    return start, end, f"WHERE {' AND '.join(where)}", params
+        params += [event["timezone"], end]
+    return f"WHERE {' AND '.join(where)}", params
 
 @app.route("/api/events/<int:event_id>/sales", methods=["GET"])
 @event_route()
 def list_sales(event_id):
     try:
-        _, _, where_sql, params = date_range_filter()
+        where_sql, params = sales_filter(g.event, *report_dates())
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -949,11 +1077,15 @@ def list_sales(event_id):
 @app.route("/api/events/<int:event_id>/report", methods=["GET"])
 @event_route()
 def get_report(event_id):
-    """Totals by day, payment method, cashier, and item or seller, optionally for start..end."""
     try:
-        start, end, where_sql, params = date_range_filter()
+        start, end = report_dates()
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    return jsonify(build_report(g.event, start, end))
+
+def build_report(event, start=None, end=None):
+    """Totals by day, payment method, cashier, and item or seller, optionally for start..end."""
+    where_sql, params = sales_filter(event, start, end)
 
     # Refunds are negative sales, so summed amounts and quantities are already net of
     # them. Counts subtract a refund, and refunds are also reported separately.
@@ -972,7 +1104,7 @@ def get_report(event_id):
                 {where_sql}
                 GROUP BY sale_date, pm.id, pm.label
                 ORDER BY sale_date, pm.id""",
-            [g.event["timezone"], *params],
+            [event["timezone"], *params],
         ).fetchall()
         cashier_rows = conn.execute(
             f"""SELECT s.cashier_name AS cashier, {net_count} AS count,
@@ -1030,7 +1162,7 @@ def get_report(event_id):
         entry["quantity"] += row["quantity"]
         entry["total_cents"] += row["total_cents"]
 
-    return jsonify(
+    return (
         {
             "start": start.isoformat() if start else None,
             "end": end.isoformat() if end else None,
@@ -1046,16 +1178,20 @@ def get_report(event_id):
             # Items at a charity drive, sellers at a yard sale
             "lines": line_rows,
             "by_department": sorted(by_department.values(), key=lambda d: -d["total_cents"])
-            if g.event["mode"] == "charity" else [],
+            if event["mode"] == "charity" else [],
         }
     )
 
 @app.route("/api/events/<int:event_id>/settlement", methods=["GET"])
 @event_route()
 def get_settlement(event_id):
-    """What each seller sold, who is holding the money, and who pays whom at the end."""
     if g.event["mode"] != "yard_sale":
         return jsonify({"error": "Settlement is only for yard sales"}), 400
+    return jsonify(build_settlement(g.event))
+
+def build_settlement(event):
+    """What each seller sold, who is holding the money, and who pays whom at the end."""
+    event_id = event["id"]
 
     with get_db_connection() as conn:
         sellers = conn.execute(
@@ -1084,9 +1220,9 @@ def get_settlement(event_id):
     names = {seller["id"]: seller["name"] for seller in sellers}
     names[CASH_BOX] = "Cash box"
     transfers = settle(owed, held)
-    return jsonify(
+    return (
         {
-            "status": g.event["status"],
+            "status": event["status"],
             "sellers": [
                 {
                     "id": seller["id"],
@@ -1110,6 +1246,333 @@ def get_settlement(event_id):
         }
     )
 
+# ----- Exports, closing email and shared report links -----
+
+def dollars(cents):
+    return f"{cents / 100:.2f}"
+
+def to_csv(rows):
+    out = io.StringIO()
+    csv.writer(out).writerows(rows)
+    return out.getvalue()
+
+def sales_csv(event):
+    """Every sale line, one per row, with times in the event's time zone."""
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """SELECT s.id, s.created_at AT TIME ZONE %s AS local_time, s.cashier_name, pm.label,
+                      s.refund_of, COALESCE(i.name, se.name) AS name, sl.description,
+                      sl.quantity, sl.list_cents, sl.final_cents
+               FROM sale_lines sl
+               JOIN sales s ON s.id = sl.sale_id
+               JOIN payment_methods pm ON pm.id = s.payment_method_id
+               LEFT JOIN items i ON i.id = sl.item_id
+               LEFT JOIN sellers se ON se.id = sl.seller_id
+               WHERE s.event_id = %s ORDER BY s.id, sl.id""",
+            (event["timezone"], event["id"]),
+        ).fetchall()
+    who = "Seller" if event["mode"] == "yard_sale" else "Item"
+    header = ["Sale", "Time", "Cashier", "Payment", "Refund of", who, "Description",
+              "Quantity", "Price", "Line total after offers"]
+    return to_csv(
+        [header]
+        + [
+            [row["id"], row["local_time"].isoformat(sep=" ", timespec="seconds"), row["cashier_name"],
+             row["label"], row["refund_of"] or "", row["name"], row["description"], row["quantity"],
+             dollars(row["list_cents"]), dollars(row["final_cents"])]
+            for row in rows
+        ]
+    )
+
+def payouts_csv(event):
+    settlement = build_settlement(event)
+    rows = [["From", "To", "Amount"]]
+    rows += [[t["from"], t["to"], dollars(t["cents"])] for t in settlement["transfers"]]
+    rows += [[], ["Seller", "Sold", "Given off", "Holding"]]
+    rows += [[s["name"], dollars(s["sold_cents"]), dollars(s["discount_cents"]), dollars(s["held_cents"])]
+             for s in settlement["sellers"]]
+    rows += [["Cash box", "", "", dollars(settlement["cash_box_cents"])]]
+    return to_csv(rows)
+
+def event_files(event):
+    files = [("sales.csv", sales_csv(event))]
+    if event["mode"] == "yard_sale":
+        files.append(("payouts.csv", payouts_csv(event)))
+    return files
+
+def shared_link(event):
+    # Tied to this close, so reopening and closing again retires the old link
+    token = shared_links.dumps([event["id"], iso(event["closed_at"])])
+    return f"{PUBLIC_URL}/r/{token}"
+
+def send_close_email(event):
+    report = build_report(event)
+    lines = [
+        f'"{event["name"]}" is closed.',
+        "",
+        f'Total: ${dollars(report["overall"]["total_cents"])} from {report["overall"]["count"]} sales.',
+    ]
+    if event["mode"] == "yard_sale":
+        transfers = build_settlement(event)["transfers"]
+        lines += ["", "Who pays whom:"]
+        lines += [f'  {t["from"]} pays {t["to"]} ${dollars(t["cents"])}' for t in transfers] or ["  Nothing to pay out."]
+    purge = event["purge_after"].astimezone(ZoneInfo(event["timezone"])).strftime("%B %-d, %Y")
+    lines += [
+        "",
+        "The full report is attached, and you can view it here:",
+        shared_link(event),
+        "",
+        "Anyone with this link can see the report, so only share it with people you trust.",
+        f"The link stops working on {purge}, when this event and all of its sales are",
+        "permanently deleted. Save the attached files if you want to keep a copy.",
+    ]
+    mail.send(event["owner_email"], f'{event["name"]}: final report', "\n".join(lines), event_files(event))
+
+def shared_event(token):
+    """The closed event a report link is for, or None if the link isn't valid any more."""
+    try:
+        event_id, closed_at = shared_links.loads(token)
+    except (BadSignature, ValueError, TypeError):
+        return None
+    with get_db_connection() as conn:
+        event = load_event(conn, event_id)
+    if (
+        not event
+        or event["status"] != "closed"
+        or iso(event["closed_at"]) != closed_at
+        or event["purge_after"] <= datetime.now(event["purge_after"].tzinfo)
+    ):
+        return None
+    return event
+
+def csv_response(text, filename):
+    return Response(
+        text,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+@app.route("/api/shared/<token>", methods=["GET"])
+def get_shared_report(token):
+    event = shared_event(token)
+    if not event:
+        return jsonify({"error": "This link has expired or isn't valid"}), 404
+    public = {k: v for k, v in event_json(event).items() if k not in ("code", "owner_email")}
+    return jsonify(
+        {
+            "event": public,
+            "report": build_report(event),
+            "settlement": build_settlement(event) if event["mode"] == "yard_sale" else None,
+        }
+    )
+
+@app.route("/api/shared/<token>/<name>.csv", methods=["GET"])
+def get_shared_csv(token, name):
+    event = shared_event(token)
+    files = dict(event_files(event)) if event else {}
+    if f"{name}.csv" not in files:
+        return jsonify({"error": "Not found"}), 404
+    return csv_response(files[f"{name}.csv"], f"{name}.csv")
+
+@app.route("/api/events/<int:event_id>/<name>.csv", methods=["GET"])
+@event_route(manage=True)
+def get_event_csv(event_id, name):
+    files = dict(event_files(g.event))
+    if f"{name}.csv" not in files:
+        return jsonify({"error": "Not found"}), 404
+    return csv_response(files[f"{name}.csv"], f"{name}.csv")
+
+# ----- Accounts, invites and password resets -----
+
+@app.route("/api/users", methods=["GET"])
+def list_users():
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """SELECT u.id, u.email, u.name, u.is_owner, u.created_at, count(e.id)::int AS events
+               FROM users u LEFT JOIN events e ON e.owner_user_id = u.id
+               GROUP BY u.id ORDER BY u.created_at"""
+        ).fetchall()
+    return jsonify([{**row, "created_at": iso(row["created_at"])} for row in rows])
+
+@app.route("/api/invites", methods=["GET"])
+def list_invites():
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, email, expires_at FROM invites WHERE expires_at > now() ORDER BY created_at"
+        ).fetchall()
+    return jsonify([{**row, "expires_at": iso(row["expires_at"])} for row in rows])
+
+@app.route("/api/invites", methods=["POST"])
+def create_invite():
+    data = request.get_json(silent=True) or {}
+    try:
+        email = clean_email(data.get("email"))
+    except (ValueError, AttributeError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    token, token_hash = new_token()
+    with get_db_connection() as conn:
+        if conn.execute("SELECT 1 FROM users WHERE email = %s", (email,)).fetchone():
+            return jsonify({"error": "That person already has an account"}), 409
+        # A new invite replaces any earlier one to the same address
+        conn.execute("DELETE FROM invites WHERE email = %s", (email,))
+        invite = conn.execute(
+            """INSERT INTO invites (email, token_hash, invited_by, expires_at)
+               VALUES (%s, %s, %s, now() + %s) RETURNING id, email, expires_at""",
+            (email, token_hash, g.user["user_id"], INVITE_LIFETIME),
+        ).fetchone()
+    mail.send(
+        email,
+        "You're invited to run sales on Sale POS",
+        f"{g.user['name']} invited you to set up charity drives and yard sales on Sale POS.\n\n"
+        f"Create your account here:\n{PUBLIC_URL}/invite/{token}\n\n"
+        f"This link works once and expires in {INVITE_LIFETIME.days} days.",
+    )
+    return jsonify({**invite, "expires_at": iso(invite["expires_at"])}), 201
+
+@app.route("/api/invites/<int:invite_id>", methods=["DELETE"])
+def delete_invite(invite_id):
+    with get_db_connection() as conn:
+        cursor = conn.execute("DELETE FROM invites WHERE id = %s", (invite_id,))
+    if cursor.rowcount == 0:
+        return jsonify({"error": "Invite not found"}), 404
+    return "", 204
+
+def find_invite(conn, token):
+    return conn.execute(
+        "SELECT * FROM invites WHERE token_hash = %s AND expires_at > now()", (hash_token(token),)
+    ).fetchone()
+
+@app.route("/api/invites/accept/<token>", methods=["GET"])
+def get_invite(token):
+    with get_db_connection() as conn:
+        invite = find_invite(conn, token)
+    if not invite:
+        return jsonify({"error": "This invite has expired or was already used"}), 404
+    return jsonify({"email": invite["email"]})
+
+@app.route("/api/invites/accept/<token>", methods=["POST"])
+def accept_invite(token):
+    data = request.get_json(silent=True) or {}
+    with get_db_connection() as conn:
+        invite = find_invite(conn, token)
+        if not invite:
+            return jsonify({"error": "This invite has expired or was already used"}), 404
+        try:
+            name = clean_text(data.get("name"), "Name")
+            password = clean_password(data.get("password"))
+        except (ValueError, AttributeError) as e:
+            return jsonify({"error": str(e)}), 400
+        try:
+            user = conn.execute(
+                """INSERT INTO users (email, name, password_hash) VALUES (%s, %s, %s)
+                   RETURNING id, password_hash""",
+                (invite["email"], name, generate_password_hash(password)),
+            ).fetchone()
+        except psycopg.errors.UniqueViolation:
+            return jsonify({"error": "That email already has an account"}), 409
+        conn.execute("DELETE FROM invites WHERE email = %s", (invite["email"],))
+    start_session("organizer", user=user)
+    return jsonify({"authenticated": True, **current_user()}), 201
+
+@app.route("/api/password-reset", methods=["POST"])
+def request_password_reset():
+    """Email a reset link. The answer is the same whether or not the email has an account."""
+    data = request.get_json(silent=True) or {}
+    email = data.get("email") if isinstance(data, dict) else None
+    if isinstance(email, str):
+        token, token_hash = new_token()
+        with get_db_connection() as conn:
+            user = conn.execute("SELECT id FROM users WHERE email = %s", (email.strip().lower(),)).fetchone()
+            if user:
+                conn.execute("DELETE FROM password_resets WHERE user_id = %s", (user["id"],))
+                conn.execute(
+                    "INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (%s, %s, now() + %s)",
+                    (user["id"], token_hash, RESET_LIFETIME),
+                )
+        if user:
+            mail.send(
+                email.strip().lower(),
+                "Reset your Sale POS password",
+                f"Someone asked to reset the password for this account.\n\n"
+                f"Choose a new password here:\n{PUBLIC_URL}/reset/{token}\n\n"
+                f"This link works once and expires in an hour. If it wasn't you, ignore this email.",
+            )
+    return jsonify({"message": "If that email has an account, a reset link is on its way."})
+
+@app.route("/api/password-reset/<token>", methods=["POST"])
+def reset_password(token):
+    data = request.get_json(silent=True) or {}
+    try:
+        password = clean_password(data.get("password"))
+    except (ValueError, AttributeError) as e:
+        return jsonify({"error": str(e)}), 400
+    with get_db_connection() as conn:
+        reset = conn.execute(
+            "DELETE FROM password_resets WHERE token_hash = %s AND expires_at > now() RETURNING user_id",
+            (hash_token(token),),
+        ).fetchone()
+        if not reset:
+            return jsonify({"error": "This link has expired or was already used"}), 400
+        # Changing the hash also logs out every session that used the old password
+        conn.execute(
+            "UPDATE users SET password_hash = %s WHERE id = %s",
+            (generate_password_hash(password), reset["user_id"]),
+        )
+        conn.execute("DELETE FROM password_resets WHERE user_id = %s", (reset["user_id"],))
+    return jsonify({"message": "Password changed. You can log in now."})
+
+# Run once in the container to make your own account, or again to reset its password:
+#   docker compose exec web flask --app app create-owner you@example.com
+@app.cli.command("create-owner")
+@click.argument("email")
+@click.option("--name", help="Your name. Defaults to the start of the email address.")
+def create_owner_command(email, name):
+    """Create the site owner account, or set a new password for it."""
+    password = click.prompt("Password", hide_input=True, confirmation_prompt=True)
+    try:
+        email = clean_email(email)
+        password_hash = generate_password_hash(clean_password(password))
+        name = clean_text(name or email.split("@")[0], "Name")
+    except ValueError as e:
+        raise click.ClickException(str(e)) from None
+    with get_db_connection() as conn:
+        updated = conn.execute(
+            "UPDATE users SET password_hash = %s, is_owner = TRUE WHERE email = %s", (password_hash, email)
+        ).rowcount
+        if not updated:
+            conn.execute(
+                "INSERT INTO users (email, name, password_hash, is_owner) VALUES (%s, %s, %s, TRUE)",
+                (email, name, password_hash),
+            )
+    click.echo(f"{'Updated' if updated else 'Created'} site owner {email}.")
+
+# Run daily (the purger service in docker-compose.yml does this)
+@app.cli.command("purge-expired")
+def purge_expired_command():
+    """Close idle events, then delete events past their purge date and expired links."""
+    with get_db_connection() as conn:
+        idle = conn.execute(
+            f"""SELECT e.id FROM events e
+                WHERE e.status = 'open'
+                  AND GREATEST(e.created_at,
+                               (SELECT max(created_at) FROM sales WHERE event_id = e.id))
+                      < now() - interval '{IDLE_CLOSE}'"""
+        ).fetchall()
+    for row in idle:
+        close_and_notify(row["id"])
+    with get_db_connection() as conn:
+        deleted = conn.execute("DELETE FROM events WHERE purge_after < now() RETURNING id, name").fetchall()
+        conn.execute("DELETE FROM invites WHERE expires_at < now()")
+        conn.execute("DELETE FROM password_resets WHERE expires_at < now()")
+        conn.execute(
+            "DELETE FROM login_failures WHERE NOT banned AND last_failure < %s",
+            (time.time() - FAILURE_WINDOW_SECONDS,),
+        )
+    for event in deleted:
+        logger.info("Purged event %s (%s)", event["id"], event["name"])
+    click.echo(f"Closed {len(idle)} idle event(s). Deleted {len(deleted)} event(s).")
+
 # Serve frontend app (if built) for SPA routes
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
@@ -1118,9 +1581,13 @@ def serve_frontend(path):
         return send_from_directory(app.static_folder, "index.html")
     return send_from_directory(app.static_folder, path)
 
-# A cashier's login link. Flask's static route would otherwise answer it with a 404.
-@app.route("/e/<code>")
-def event_link(code):
+# Links handed out to people: a cashier's login, an invite, a password reset and a
+# shared report. Flask's static route would otherwise answer them with a 404.
+@app.route("/e/<token>")
+@app.route("/invite/<token>")
+@app.route("/reset/<token>")
+@app.route("/r/<token>")
+def frontend_link(token):
     return send_from_directory(app.static_folder, "index.html")
 
 if __name__ == "__main__":

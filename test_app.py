@@ -1,16 +1,19 @@
 import os
+import re
 import unittest
 
 # These tests empty every table, so they only run against a database set aside for them
 if not os.environ.get("TEST_DATABASE_URL"):
     raise unittest.SkipTest("Set TEST_DATABASE_URL to a throwaway Postgres database to run these tests")
 os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
-os.environ["ADMIN_CODE"] = "99990000"
 os.environ["SECRET_KEY"] = "test-secret"
+os.environ["PUBLIC_URL"] = "https://sales.example.com"
+os.environ.pop("SMTP_HOST", None)
 
 import app as pos
 
-ADMIN = "99990000"
+OWNER_PASSWORD = "owner-password-1"
+ORGANIZER_PASSWORD = "organizer-pass-1"
 
 
 def sql(query, params=()):
@@ -23,12 +26,25 @@ class PosTestCase(unittest.TestCase):
     MODE = "charity"
 
     def setUp(self):
-        sql("TRUNCATE events, login_failures RESTART IDENTITY CASCADE")
-        self.admin = self.client_for(ADMIN)
+        sql("TRUNCATE events, users, invites, password_resets, login_failures RESTART IDENTITY CASCADE")
+        # Every email the app sends lands here instead
+        self.outbox = []
+        pos.mail.deliver = self.outbox.append
+        pos.create_user("owner@example.com", "Owen", OWNER_PASSWORD, is_owner=True)
+        pos.create_user("olive@example.com", "Olive", ORGANIZER_PASSWORD)
+        self.owner = self.user_client("owner@example.com", OWNER_PASSWORD)
+        # Most tests act as an ordinary organizer who owns the event
+        self.admin = self.user_client("olive@example.com", ORGANIZER_PASSWORD)
         self.event = self.admin.post("/api/events", json={"name": "Drive", "mode": self.MODE}).json
         self.base = f"/api/events/{self.event['id']}"
         self.admin.post(f"{self.base}/cashiers", json={"name": "Pat", "pin": "123456"})
         self.methods = {m["label"]: m["id"] for m in self.admin.get(self.base).json["payment_methods"]}
+
+    def user_client(self, email, password):
+        client = pos.app.test_client()
+        response = client.post("/api/login", json={"email": email, "password": password})
+        self.assertEqual(response.status_code, 200, response.json)
+        return client
 
     def client_for(self, code, event_code=None):
         client = pos.app.test_client()
@@ -71,9 +87,15 @@ class AuthTests(PosTestCase):
             [],
             {"code": "123456"},
             {"code": "123456", "event_code": "NOPE"},
+            {"email": "olive@example.com", "password": "wrong-password"},
+            {"email": "nobody@example.com", "password": ORGANIZER_PASSWORD},
+            {"email": "olive@example.com", "password": 12345},
+            {"code": "99990000"},
         ]
         for body in bodies:
             self.assertEqual(client.post("/api/login", json=body).status_code, 401, body)
+            # There are more bad bodies than the lockout allows
+            sql("DELETE FROM login_failures")
 
     def test_cashier_pin_only_works_at_their_event(self):
         other = self.admin.post("/api/events", json={"name": "Other", "mode": "charity"}).json
@@ -183,7 +205,6 @@ class CashierTests(PosTestCase):
             {"name": "Sam", "pin": "123456789"},
             {"name": "Sam", "pin": "abcd"},
             {"name": "Sam", "pin": 5555},
-            {"name": "Sam", "pin": ADMIN},
             {"name": "Sam"},
         ]
         for body in bad:
@@ -243,9 +264,10 @@ class BanTests(PosTestCase):
 
     def test_admin_lists_and_unblocks(self):
         self.fail(pos.MAX_LOGIN_FAILURES)
-        blocks = self.admin.get("/api/login-blocks").json
+        self.assertEqual(self.admin.get("/api/login-blocks").status_code, 403)
+        blocks = self.owner.get("/api/login-blocks").json
         self.assertEqual([(b["ip"], b["banned"]) for b in blocks], [(self.VISITOR, True)])
-        self.assertEqual(self.admin.delete(f"/api/login-blocks/{self.VISITOR}").status_code, 204)
+        self.assertEqual(self.owner.delete(f"/api/login-blocks/{self.VISITOR}").status_code, 204)
         self.assertEqual(self.attempt().status_code, 200)
         self.assertEqual(self.cashier().get("/api/login-blocks").status_code, 403)
 
@@ -347,7 +369,7 @@ class CharitySaleTests(PosTestCase):
         sale = self.sell(self.client, [{"item_id": self.nuts, "price_cents": 500, "quantity": 2}]).json
         refund = self.admin.post(f"{self.base}/sales/{sale['id']}/refund")
         self.assertEqual(refund.status_code, 201)
-        self.assertEqual((refund.json["total_cents"], refund.json["cashier"]), (-1000, "Admin"))
+        self.assertEqual((refund.json["total_cents"], refund.json["cashier"]), (-1000, "Olive"))
         self.assertEqual(self.admin.post(f"{self.base}/sales/{sale['id']}/refund").status_code, 409)
         self.assertEqual(self.admin.post(f"{self.base}/sales/{refund.json['id']}/refund").status_code, 400)
         self.assertEqual(self.admin.post(f"{self.base}/sales/99999/refund").status_code, 404)
@@ -439,6 +461,313 @@ class YardSaleTests(PosTestCase):
         self.assertEqual(self.sell(self.client, [{"item_id": 1, "price_cents": 100}]).status_code, 400)
         charity = self.admin.post("/api/events", json={"name": "C", "mode": "charity"}).json
         self.assertEqual(self.admin.get(f"/api/events/{charity['id']}/settlement").status_code, 400)
+
+
+
+def link_token(message, prefix):
+    """Pull the token out of a link like https://sales.example.com/<prefix>/<token> in an email."""
+    body = message.get_body(("plain",)).get_content()
+    match = re.search(rf"{re.escape(os.environ['PUBLIC_URL'])}/{prefix}/(\S+)", body)
+    assert match, body
+    return match.group(1)
+
+
+def attachments(message):
+    return {part.get_filename(): part.get_content() for part in message.iter_attachments()}
+
+
+class AccountTests(PosTestCase):
+    def test_session_shows_organizer(self):
+        session = self.admin.get("/api/session").json
+        self.assertEqual(
+            {k: session[k] for k in ["role", "name", "email", "is_owner"]},
+            {"role": "organizer", "name": "Olive", "email": "olive@example.com", "is_owner": False},
+        )
+        self.assertTrue(self.owner.get("/api/session").json["is_owner"])
+
+    def test_email_is_not_case_sensitive(self):
+        self.user_client(" Olive@Example.com ", ORGANIZER_PASSWORD)
+
+    def test_passwords_are_hashed(self):
+        stored = sql("SELECT password_hash FROM users WHERE email = 'olive@example.com'")[0]["password_hash"]
+        self.assertNotIn(ORGANIZER_PASSWORD, stored)
+
+    def test_wrong_passwords_count_toward_lockout(self):
+        client = pos.app.test_client()
+        for _ in range(pos.MAX_LOGIN_FAILURES):
+            client.post("/api/login", json={"email": "olive@example.com", "password": "nope-nope-nope"})
+        response = client.post("/api/login", json={"email": "olive@example.com", "password": ORGANIZER_PASSWORD})
+        self.assertEqual(response.status_code, 429)
+
+    def test_create_owner_command(self):
+        runner = pos.app.test_cli_runner()
+        result = runner.invoke(args=["create-owner", "boss@example.com", "--name", "Boss"],
+                               input="boss-password-1\nboss-password-1\n")
+        self.assertEqual(result.exit_code, 0, result.output)
+        client = self.user_client("boss@example.com", "boss-password-1")
+        self.assertTrue(client.get("/api/session").json["is_owner"])
+
+        # Running it again for an existing account resets the password
+        result = runner.invoke(args=["create-owner", "boss@example.com"], input="new-password-22\nnew-password-22\n")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.user_client("boss@example.com", "new-password-22")
+
+    def test_create_owner_rejects_short_password(self):
+        result = pos.app.test_cli_runner().invoke(args=["create-owner", "boss@example.com"], input="short\nshort\n")
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(sql("SELECT count(*) AS n FROM users WHERE email = 'boss@example.com'")[0]["n"], 0)
+
+
+class OwnershipTests(PosTestCase):
+    def setUp(self):
+        super().setUp()
+        pos.create_user("rita@example.com", "Rita", "rita-password-1")
+        self.rita = self.user_client("rita@example.com", "rita-password-1")
+
+    def test_organizer_sees_only_their_own_events(self):
+        mine = self.rita.post("/api/events", json={"name": "Rita's", "mode": "yard_sale"}).json
+        self.assertEqual([e["id"] for e in self.rita.get("/api/events").json], [mine["id"]])
+        self.assertEqual([e["id"] for e in self.admin.get("/api/events").json], [self.event["id"]])
+        for path in ["", "/sales", "/report", "/cashiers"]:
+            self.assertEqual(self.rita.get(f"{self.base}{path}").status_code, 404, path)
+        self.assertEqual(self.rita.post(f"{self.base}/close").status_code, 404)
+        self.assertEqual(self.rita.delete(self.base).status_code, 404)
+
+    def test_owner_sees_every_event(self):
+        self.rita.post("/api/events", json={"name": "Rita's", "mode": "yard_sale"})
+        self.assertEqual(len(self.owner.get("/api/events").json), 2)
+        self.assertEqual(self.owner.get(f"{self.base}/report").status_code, 200)
+
+    def test_events_list_shows_owner(self):
+        listed = self.owner.get("/api/events").json[0]
+        self.assertEqual(listed["owner_email"], "olive@example.com")
+
+    def test_organizer_cannot_manage_site(self):
+        for path in ["/api/invites", "/api/users", "/api/login-blocks"]:
+            self.assertEqual(self.admin.get(path).status_code, 403, path)
+        self.assertEqual(self.admin.post("/api/invites", json={"email": "x@example.com"}).status_code, 403)
+
+
+class InviteTests(PosTestCase):
+    def invite(self, email="new@example.com"):
+        response = self.owner.post("/api/invites", json={"email": email})
+        self.assertEqual(response.status_code, 201, response.json)
+        return link_token(self.outbox[-1], "invite")
+
+    def test_invite_email_and_accept(self):
+        token = self.invite()
+        self.assertEqual(self.outbox[-1]["To"], "new@example.com")
+        self.assertEqual(pos.app.test_client().get(f"/api/invites/accept/{token}").json["email"], "new@example.com")
+
+        client = pos.app.test_client()
+        response = client.post(f"/api/invites/accept/{token}", json={"name": "Nina", "password": "nina-password-1"})
+        self.assertEqual(response.status_code, 201, response.json)
+        self.assertEqual(client.get("/api/session").json["name"], "Nina")
+        self.assertFalse(client.get("/api/session").json["is_owner"])
+        self.user_client("new@example.com", "nina-password-1")
+
+        # Each invite works once
+        again = pos.app.test_client().post(f"/api/invites/accept/{token}", json={"name": "X", "password": "another-pass-1"})
+        self.assertEqual(again.status_code, 404)
+
+    def test_pending_invites_listed_and_cancelled(self):
+        self.invite()
+        pending = self.owner.get("/api/invites").json
+        self.assertEqual([i["email"] for i in pending], ["new@example.com"])
+        self.assertNotIn("token", pending[0])
+        self.assertEqual(self.owner.delete(f"/api/invites/{pending[0]['id']}").status_code, 204)
+        self.assertEqual(self.owner.get("/api/invites").json, [])
+
+    def test_cancelled_or_expired_invite_does_not_work(self):
+        token = self.invite()
+        sql("UPDATE invites SET expires_at = now() - interval '1 minute'")
+        self.assertEqual(pos.app.test_client().get(f"/api/invites/accept/{token}").status_code, 404)
+        self.assertEqual(pos.app.test_client().get("/api/invites/accept/made-up-token").status_code, 404)
+
+    def test_invalid_invites_rejected(self):
+        for email in ["", "not-an-email", "olive@example.com"]:
+            self.assertEqual(self.owner.post("/api/invites", json={"email": email}).status_code,
+                             409 if email == "olive@example.com" else 400, email)
+
+    def test_short_password_rejected_on_accept(self):
+        token = self.invite()
+        response = pos.app.test_client().post(f"/api/invites/accept/{token}", json={"name": "Nina", "password": "short"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_users_listed_for_owner(self):
+        users = self.owner.get("/api/users").json
+        self.assertEqual(sorted(u["email"] for u in users), ["olive@example.com", "owner@example.com"])
+        self.assertNotIn("password_hash", users[0])
+
+
+class PasswordResetTests(PosTestCase):
+    def request_reset(self, email="olive@example.com"):
+        response = pos.app.test_client().post("/api/password-reset", json={"email": email})
+        self.assertEqual(response.status_code, 200)
+
+    def test_reset_password_by_email(self):
+        self.request_reset("OLIVE@example.com")
+        token = link_token(self.outbox[-1], "reset")
+        client = pos.app.test_client()
+        self.assertEqual(client.post(f"/api/password-reset/{token}", json={"password": "brand-new-pass-1"}).status_code, 200)
+        self.user_client("olive@example.com", "brand-new-pass-1")
+        failed = pos.app.test_client().post("/api/login", json={"email": "olive@example.com", "password": ORGANIZER_PASSWORD})
+        self.assertEqual(failed.status_code, 401)
+        # Each link works once
+        self.assertEqual(client.post(f"/api/password-reset/{token}", json={"password": "another-pass-12"}).status_code, 400)
+
+    def test_unknown_email_gets_same_answer_and_no_email(self):
+        self.request_reset("nobody@example.com")
+        self.assertEqual(self.outbox, [])
+
+    def test_expired_link_rejected(self):
+        self.request_reset()
+        token = link_token(self.outbox[-1], "reset")
+        sql("UPDATE password_resets SET expires_at = now() - interval '1 minute'")
+        response = pos.app.test_client().post(f"/api/password-reset/{token}", json={"password": "brand-new-pass-1"})
+        self.assertEqual(response.status_code, 400)
+
+
+class CloseEventTests(PosTestCase):
+    MODE = "yard_sale"
+
+    def setUp(self):
+        super().setUp()
+        self.mary = self.add("sellers", name="Mary")
+        self.paul = self.add("sellers", name="Paul")
+        self.sell(self.cashier(), [{"seller_id": self.mary, "price_cents": 1000},
+                                   {"seller_id": self.paul, "price_cents": 500, "description": 'Chair, "blue"'}])
+
+    def close(self):
+        response = self.admin.post(f"{self.base}/close")
+        self.assertEqual(response.status_code, 200)
+        return response.json
+
+    def test_close_sets_purge_date_six_months_out(self):
+        event = self.close()
+        closed = pos.datetime.fromisoformat(event["closed_at"])
+        purge = pos.datetime.fromisoformat(event["purge_after"])
+        self.assertTrue(180 <= (purge - closed).days <= 184)
+        self.assertIsNone(self.admin.post(f"{self.base}/reopen").json["purge_after"])
+
+    def test_close_emails_owner_with_csvs_and_link(self):
+        self.close()
+        self.assertEqual(len(self.outbox), 1)
+        message = self.outbox[0]
+        self.assertEqual(message["To"], "olive@example.com")
+        self.assertIn("Drive", message["Subject"])
+        files = attachments(message)
+        self.assertEqual(set(files), {"sales.csv", "payouts.csv"})
+        self.assertIn('"Chair, ""blue"""', files["sales.csv"].decode() if isinstance(files["sales.csv"], bytes) else files["sales.csv"])
+        payouts = files["payouts.csv"]
+        payouts = payouts.decode() if isinstance(payouts, bytes) else payouts
+        self.assertIn("Cash box,Mary,10.00", payouts)
+        self.assertIn("/r/", message.get_body(("plain",)).get_content())
+
+    def test_charity_close_has_no_payouts_csv(self):
+        charity = self.admin.post("/api/events", json={"name": "C", "mode": "charity"}).json
+        self.admin.post(f"/api/events/{charity['id']}/close")
+        self.assertEqual(set(attachments(self.outbox[-1])), {"sales.csv"})
+
+    def test_closing_twice_sends_one_email(self):
+        self.close()
+        self.close()
+        self.assertEqual(len(self.outbox), 1)
+
+    def test_failed_email_does_not_stop_close(self):
+        def broken(message):
+            raise OSError("mail server down")
+        pos.mail.deliver = broken
+        self.assertEqual(self.close()["status"], "closed")
+
+
+class SharedReportTests(CloseEventTests):
+    def shared_token(self):
+        self.close()
+        return link_token(self.outbox[-1], "r")
+
+    def test_link_shows_report_without_login(self):
+        token = self.shared_token()
+        client = pos.app.test_client()
+        response = client.get(f"/api/shared/{token}")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["event"]["name"], "Drive")
+        self.assertEqual(response.json["report"]["overall"]["total_cents"], 1500)
+        self.assertEqual(len(response.json["settlement"]["transfers"]), 2)
+        self.assertIn("purge_after", response.json["event"])
+        csv = client.get(f"/api/shared/{token}/sales.csv")
+        self.assertEqual(csv.status_code, 200)
+        self.assertIn("text/csv", csv.headers["Content-Type"])
+        self.assertEqual(client.get(f"/api/shared/{token}/payouts.csv").status_code, 200)
+        self.assertEqual(client.get(f"/api/shared/{token}/other.csv").status_code, 404)
+
+    def test_link_stops_after_purge_date(self):
+        token = self.shared_token()
+        sql("UPDATE events SET purge_after = now() - interval '1 minute'")
+        self.assertEqual(pos.app.test_client().get(f"/api/shared/{token}").status_code, 404)
+
+    def test_link_stops_when_reopened(self):
+        token = self.shared_token()
+        self.admin.post(f"{self.base}/reopen")
+        self.assertEqual(pos.app.test_client().get(f"/api/shared/{token}").status_code, 404)
+
+    def test_tampered_link_rejected(self):
+        token = self.shared_token()
+        self.assertEqual(pos.app.test_client().get(f"/api/shared/{token[:-2]}xx").status_code, 404)
+
+    def test_organizer_can_get_csv_while_logged_in(self):
+        response = self.admin.get(f"{self.base}/sales.csv")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Mary", response.get_data(as_text=True))
+        self.assertEqual(self.cashier().get(f"{self.base}/sales.csv").status_code, 403)
+
+
+class PurgeTests(PosTestCase):
+    def run_purge(self):
+        result = pos.app.test_cli_runner().invoke(args=["purge-expired"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        return result.output
+
+    def test_expired_events_are_deleted_with_everything_in_them(self):
+        pie = self.add("items", name="Pie")
+        self.sell(self.cashier(), [{"item_id": pie, "price_cents": 500}])
+        keep = self.admin.post("/api/events", json={"name": "Keep", "mode": "charity"}).json
+        self.admin.post(f"{self.base}/close")
+        sql("UPDATE events SET purge_after = now() - interval '1 day' WHERE id = %s", (self.event["id"],))
+
+        self.assertIn("Deleted 1 event", self.run_purge())
+        self.assertEqual([r["id"] for r in sql("SELECT id FROM events")], [keep["id"]])
+        for table in ["items", "cashiers", "sales", "sale_lines"]:
+            self.assertEqual(sql(f"SELECT count(*) AS n FROM {table}")[0]["n"], 0, table)
+
+    def test_not_yet_expired_events_are_kept(self):
+        self.admin.post(f"{self.base}/close")
+        self.run_purge()
+        self.assertEqual(len(sql("SELECT id FROM events")), 1)
+
+    def test_idle_open_event_is_closed_and_emailed(self):
+        sql("UPDATE events SET created_at = now() - interval '61 days'")
+        self.run_purge()
+        event = sql("SELECT status, purge_after FROM events")[0]
+        self.assertEqual(event["status"], "closed")
+        self.assertIsNotNone(event["purge_after"])
+        self.assertEqual(len(self.outbox), 1)
+
+    def test_event_with_recent_sales_stays_open(self):
+        pie = self.add("items", name="Pie")
+        self.sell(self.cashier(), [{"item_id": pie, "price_cents": 500}])
+        sql("UPDATE events SET created_at = now() - interval '90 days'")
+        self.run_purge()
+        self.assertEqual(sql("SELECT status FROM events")[0]["status"], "open")
+
+    def test_expired_invites_and_resets_are_cleared(self):
+        self.owner.post("/api/invites", json={"email": "new@example.com"})
+        pos.app.test_client().post("/api/password-reset", json={"email": "olive@example.com"})
+        sql("UPDATE invites SET expires_at = now() - interval '1 day'")
+        sql("UPDATE password_resets SET expires_at = now() - interval '1 day'")
+        self.run_purge()
+        self.assertEqual(sql("SELECT count(*) AS n FROM invites")[0]["n"], 0)
+        self.assertEqual(sql("SELECT count(*) AS n FROM password_resets")[0]["n"], 0)
 
 
 if __name__ == "__main__":

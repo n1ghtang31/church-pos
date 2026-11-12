@@ -1,18 +1,28 @@
 import { useState, useEffect, useCallback } from "react";
 import "./App.css";
+import Accounts from "./Accounts";
 import EventSetup from "./EventSetup";
 import Events from "./Events";
 import Journal from "./Journal";
+import { AcceptInvite, ResetPassword } from "./LinkPages";
 import Login from "./Login";
 import Register from "./Register";
 import Reports from "./Reports";
 import Settlement from "./Settlement";
+import SharedReport from "./SharedReport";
+
+// Emailed links that open their own page: /invite/<token>, /reset/<token> and /r/<token>
+const linkPage = () => {
+  const match = /^\/(invite|reset|r)\/([^/]+)\/?$/.exec(window.location.pathname);
+  return match ? { page: match[1], token: match[2] } : null;
+};
 
 function App() {
+  const [link, setLink] = useState(linkPage);
   const [authenticated, setAuthenticated] = useState(null);
   const [user, setUser] = useState(null);
   const [view, setView] = useState("register");
-  // The event being worked on. A cashier always has theirs; the admin picks one.
+  // The event being worked on. A cashier always has theirs; an organizer picks one.
   const [eventId, setEventId] = useState(null);
   const [event, setEvent] = useState(null);
   const [error, setError] = useState("");
@@ -29,11 +39,14 @@ function App() {
   const startSession = (session) => {
     setUser(session);
     setEventId(session.event_id ?? null);
-    setView(session.role === "admin" ? "events" : "register");
+    setView(session.role === "organizer" ? "events" : "register");
     setAuthenticated(session.authenticated);
   };
 
   useEffect(() => {
+    if (link) {
+      return;
+    }
     fetch("/api/session")
       .then((response) => response.json())
       .then(startSession)
@@ -41,7 +54,7 @@ function App() {
         console.error("Error checking session:", error);
         setAuthenticated(false);
       });
-  }, []);
+  }, [link]);
 
   const loadEvent = useCallback(async () => {
     if (eventId === null) {
@@ -86,6 +99,24 @@ function App() {
     setView("events");
   };
 
+  if (link?.page === "r") {
+    return <SharedReport token={link.token} />;
+  }
+  if (link?.page === "reset") {
+    return <ResetPassword token={link.token} />;
+  }
+  if (link?.page === "invite") {
+    return (
+      <AcceptInvite
+        token={link.token}
+        onLogin={(session) => {
+          setLink(null);
+          startSession(session);
+        }}
+      />
+    );
+  }
+
   if (authenticated === null) {
     return null;
   }
@@ -94,7 +125,7 @@ function App() {
     return <Login onLogin={startSession} />;
   }
 
-  const admin = user?.role === "admin";
+  const admin = user?.role === "organizer";
   const tab = (name, label) => (
     <button
       key={name}
@@ -111,6 +142,7 @@ function App() {
 
       <nav className="app-nav">
         {admin && tab("events", "Events")}
+        {user?.is_owner && tab("accounts", "Accounts")}
         {event && (
           <>
             {!admin && tab("register", "Register")}
@@ -128,7 +160,8 @@ function App() {
 
       {error && <div className="login-error">{error}</div>}
 
-      {view === "events" && <Events api={api} onOpen={openEvent} />}
+      {view === "events" && <Events api={api} onOpen={openEvent} showOwner={user?.is_owner} />}
+      {view === "accounts" && <Accounts api={api} />}
 
       {event && (
         <>
