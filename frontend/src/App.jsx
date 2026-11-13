@@ -4,16 +4,17 @@ import Accounts from "./Accounts";
 import EventSetup from "./EventSetup";
 import Events from "./Events";
 import Journal from "./Journal";
-import { AcceptInvite, ResetPassword } from "./LinkPages";
+import { AcceptInvite, ResetPassword, VerifyEmail } from "./LinkPages";
 import Login from "./Login";
 import Register from "./Register";
 import Reports from "./Reports";
 import Settlement from "./Settlement";
 import SharedReport from "./SharedReport";
 
-// Emailed links that open their own page: /invite/<token>, /reset/<token> and /r/<token>
+// Emailed links that open their own page: /invite/<token>, /reset/<token>,
+// /verify/<token> and /r/<token>
 const linkPage = () => {
-  const match = /^\/(invite|reset|r)\/([^/]+)\/?$/.exec(window.location.pathname);
+  const match = /^\/(invite|reset|verify|r)\/([^/]+)\/?$/.exec(window.location.pathname);
   return match ? { page: match[1], token: match[2] } : null;
 };
 
@@ -38,8 +39,16 @@ function App() {
 
   const startSession = (session) => {
     setUser(session);
-    setEventId(session.event_id ?? null);
-    setView(session.role === "organizer" ? "events" : "register");
+    // Back from paying on Stripe: /app?paid=<event id>
+    const paidFor = Number(new URLSearchParams(window.location.search).get("paid")) || null;
+    if (paidFor && session.role === "organizer") {
+      window.history.replaceState(null, "", "/app");
+      setEventId(paidFor);
+      setView("setup");
+    } else {
+      setEventId(session.event_id ?? null);
+      setView(session.role === "organizer" ? "events" : "register");
+    }
     setAuthenticated(session.authenticated);
   };
 
@@ -105,6 +114,17 @@ function App() {
   if (link?.page === "reset") {
     return <ResetPassword token={link.token} />;
   }
+  if (link?.page === "verify") {
+    return (
+      <VerifyEmail
+        token={link.token}
+        onLogin={(session) => {
+          setLink(null);
+          startSession(session);
+        }}
+      />
+    );
+  }
   if (link?.page === "invite") {
     return (
       <AcceptInvite
@@ -138,18 +158,19 @@ function App() {
 
   return (
     <div className="pos-container">
-      <h1>{event ? event.name : "Sale POS"}</h1>
+      <h1>{event ? event.name : "SplitTheSale"}</h1>
 
       <nav className="app-nav">
         {admin && tab("events", "Events")}
         {user?.is_owner && tab("accounts", "Accounts")}
         {event && (
           <>
-            {!admin && tab("register", "Register")}
+            {/* At a free sale the organizer rings up sales themselves */}
+            {(!admin || event.plan === "free") && tab("register", "Register")}
             {admin && tab("setup", "Setup")}
             {tab("journal", "Journal")}
             {tab("reports", "Reports")}
-            {event.mode === "yard_sale" && tab("payouts", "Payouts")}
+            {event.mode === "yard_sale" && event.plan !== "free" && tab("payouts", "Payouts")}
           </>
         )}
         <span className="nav-user">{user?.name}</span>
@@ -171,6 +192,7 @@ function App() {
               key={event.id}
               api={api}
               event={event}
+              isOwner={user?.is_owner}
               onChanged={loadEvent}
               onDeleted={closeEvent}
             />

@@ -169,11 +169,18 @@ function Register({ api, event }) {
   if (event.status !== "open") {
     return <p className="login-error">This event is closed, so no more sales can be rung up.</p>;
   }
+  if (!event.paid) {
+    return (
+      <p className="login-error">
+        This event hasn't been paid for yet. The organizer can pay under Setup to start selling.
+      </p>
+    );
+  }
 
   return (
     <div className="pos-layout">
       <div className="items-section">
-        <h2>{yardSale ? "Whose is it?" : "Items"}</h2>
+        <h2>{event.plan === "free" ? "Add an item" : yardSale ? "Whose is it?" : "Items"}</h2>
 
         {!yardSale && (
           <div className="department-tabs">

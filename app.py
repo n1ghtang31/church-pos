@@ -22,7 +22,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from pos import mail
+from pos import billing, mail
 from pos.money import CASH_BOX, allocate_discount, settle
 
 # Configure logging
@@ -61,9 +61,14 @@ app.config.update(
     MAX_CONTENT_LENGTH=64 * 1024,
 )
 
-PUBLIC_API_PATHS = {"/api/login", "/api/session", "/api/health", "/api/password-reset"}
+PUBLIC_API_PATHS = {
+    "/api/login", "/api/session", "/api/health", "/api/password-reset",
+    "/api/signup", "/api/signup/resend",
+    # Stripe calls this, and it's checked by its signature instead
+    "/api/stripe/webhook",
+}
 # Anyone holding one of these emailed links may use it without logging in
-PUBLIC_API_PREFIXES = ("/api/password-reset/", "/api/invites/accept/", "/api/shared/")
+PUBLIC_API_PREFIXES = ("/api/password-reset/", "/api/invites/accept/", "/api/shared/", "/api/verify/")
 # Only the site owner may use these
 OWNER_API_PREFIXES = ("/api/login-blocks", "/api/invites", "/api/users")
 
@@ -93,6 +98,8 @@ CODE_LENGTH = 6
 MIN_PASSWORD_LENGTH = 10
 INVITE_LIFETIME = timedelta(days=7)
 RESET_LIFETIME = timedelta(hours=1)
+VERIFY_LIFETIME = timedelta(days=1)
+PLANS = ("free", "paid")
 # A closed event and everything in it is deleted this long after it closes
 RETENTION = "6 months"
 # An open event with no sales for this long is closed for the organizer
@@ -227,12 +234,14 @@ def clean_password(value):
         raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters")
     return value
 
-def create_user(email, name, password, is_owner=False):
+def create_user(email, name, password, is_owner=False, verified=True):
     """Add an organizer account and return its id."""
     with get_db_connection() as conn:
         return conn.execute(
-            "INSERT INTO users (email, name, password_hash, is_owner) VALUES (%s, %s, %s, %s) RETURNING id",
-            (clean_email(email), clean_text(name, "Name"), generate_password_hash(clean_password(password)), is_owner),
+            """INSERT INTO users (email, name, password_hash, is_owner, email_verified_at)
+               VALUES (%s, %s, %s, %s, CASE WHEN %s THEN now() END) RETURNING id""",
+            (clean_email(email), clean_text(name, "Name"), generate_password_hash(clean_password(password)),
+             is_owner, verified),
         ).fetchone()["id"]
 
 def password_tag(password_hash):
@@ -398,9 +407,15 @@ def login():
     if isinstance(email, str) and isinstance(password, str):
         with get_db_connection() as conn:
             user = conn.execute(
-                "SELECT id, password_hash FROM users WHERE email = %s", (email.strip().lower(),)
+                "SELECT id, password_hash, email_verified_at FROM users WHERE email = %s",
+                (email.strip().lower(),),
             ).fetchone()
         if check_password_hash(user["password_hash"] if user else DUMMY_PASSWORD_HASH, password) and user:
+            if not user["email_verified_at"]:
+                return jsonify({
+                    "error": "Check your email for the link to finish signing up",
+                    "unverified": True,
+                }), 403
             role = "organizer"
         else:
             user = None
@@ -547,6 +562,8 @@ def event_json(event):
         "closed_at": iso(event["closed_at"]),
         "purge_after": iso(event["purge_after"]),
         "owner_email": event.get("owner_email"),
+        "plan": event["plan"],
+        "paid": event["plan"] == "free" or event["paid_at"] is not None,
     }
 
 @app.route("/api/events", methods=["GET"])
@@ -572,22 +589,49 @@ def create_event():
     data = request.get_json(silent=True) or {}
     try:
         name = clean_text(data.get("name"), "Name", 80)
-        if data.get("mode") not in MODES:
+        plan = data.get("plan", "paid")
+        if plan not in PLANS:
+            raise ValueError("Plan must be free or paid")
+        # A free event is always a yard sale
+        mode = data.get("mode", "yard_sale" if plan == "free" else None)
+        if mode not in MODES:
             raise ValueError("Mode must be charity or yard_sale")
+        if plan == "free" and mode != "yard_sale":
+            raise ValueError("Free events are yard sales")
         timezone = clean_timezone(data.get("timezone") or DEFAULT_TIMEZONE)
     except (ValueError, AttributeError) as e:
         return jsonify({"error": str(e)}), 400
 
     with get_db_connection() as conn:
+        if plan == "free":
+            # Serializes this organizer's requests so two can't both slip past the check
+            conn.execute("SELECT 1 FROM users WHERE id = %s FOR UPDATE", (g.user["user_id"],))
+            if conn.execute(
+                "SELECT 1 FROM events WHERE owner_user_id = %s AND plan = 'free'", (g.user["user_id"],)
+            ).fetchone():
+                return jsonify({"error": "You already have a free sale today. It's cleared at midnight."}), 409
         event_id = conn.execute(
-            """INSERT INTO events (code, name, mode, timezone, owner_user_id)
-               VALUES (%s, %s, %s, %s, %s) RETURNING id""",
-            (new_event_code(conn), name, data["mode"], timezone, g.user["user_id"]),
+            """INSERT INTO events (code, name, mode, timezone, owner_user_id, plan, paid_at, purge_after)
+               VALUES (%s, %s, %s, %s, %s, %s,
+                       -- The site owner's own events are never charged
+                       CASE WHEN %s THEN now() END,
+                       -- A free event lasts until midnight where it's held
+                       CASE WHEN %s = 'free' THEN
+                           (date_trunc('day', now() AT TIME ZONE %s) + interval '1 day') AT TIME ZONE %s
+                       END)
+               RETURNING id""",
+            (new_event_code(conn), name, mode, timezone, g.user["user_id"], plan,
+             g.user["is_owner"] and plan == "paid", plan, timezone, timezone),
         ).fetchone()["id"]
-        for label, kind in DEFAULT_PAYMENT_METHODS[data["mode"]]:
+        for label, kind in DEFAULT_PAYMENT_METHODS[mode]:
             conn.execute(
                 "INSERT INTO payment_methods (event_id, label, kind) VALUES (%s, %s, %s)",
                 (event_id, label, kind),
+            )
+        if plan == "free":
+            # The organizer is the one seller
+            conn.execute(
+                "INSERT INTO sellers (event_id, name) VALUES (%s, %s)", (event_id, g.user["name"])
             )
         event = load_event(conn, event_id)
     return jsonify(event_json(event)), 201
@@ -646,12 +690,13 @@ def close_and_notify(event_id):
     with get_db_connection() as conn:
         closed = conn.execute(
             f"""UPDATE events SET status = 'closed', closed_at = now(),
-                       purge_after = now() + interval '{RETENTION}'
+                       purge_after = CASE WHEN plan = 'free' THEN purge_after
+                                          ELSE now() + interval '{RETENTION}' END
                 WHERE id = %s AND status = 'open' RETURNING id""",
             (event_id,),
         ).fetchone()
         event = load_event(conn, event_id)
-    if closed and event["owner_email"]:
+    if closed and event["owner_email"] and event["plan"] == "paid":
         # The event is closed either way. If the email fails, the organizer can still
         # download everything from the event's Reports.
         try:
@@ -670,7 +715,9 @@ def close_event(event_id):
 def reopen_event(event_id):
     with get_db_connection() as conn:
         conn.execute(
-            "UPDATE events SET status = 'open', closed_at = NULL, purge_after = NULL WHERE id = %s",
+            """UPDATE events SET status = 'open', closed_at = NULL,
+                   purge_after = CASE WHEN plan = 'free' THEN purge_after END
+               WHERE id = %s""",
             (event_id,),
         )
         event = load_event(conn, event_id)
@@ -689,6 +736,8 @@ def clean_item(conn, data):
 def clean_seller(conn, data):
     if g.event["mode"] != "yard_sale":
         raise ValueError("Sellers are only used at a yard sale")
+    if g.event["plan"] == "free":
+        raise ValueError("A free sale has one seller. Start a paid yard sale to split sales between families.")
     return {"name": clean_text(data.get("name"), "Name")}
 
 def clean_payment_method(conn, data):
@@ -805,6 +854,8 @@ def get_cashiers(event_id):
 @app.route("/api/events/<int:event_id>/cashiers", methods=["POST"])
 @event_route(manage=True)
 def create_cashier(event_id):
+    if g.event["plan"] == "free":
+        return jsonify({"error": "A free sale is run by you alone. Start a paid event to add cashiers."}), 400
     data = request.get_json(silent=True) or {}
     try:
         name = clean_text(data.get("name"), "Name")
@@ -908,10 +959,13 @@ def validate_lines(conn, raw_lines):
 @app.route("/api/events/<int:event_id>/sales", methods=["POST"])
 @event_route()
 def create_sale(event_id):
-    if g.user["role"] != "cashier":
+    # At a free event the organizer rings up their own sales
+    if g.user["role"] != "cashier" and g.event["plan"] != "free":
         return jsonify({"error": "Log in as a cashier to record sales"}), 403
     if closed := require_open_event():
         return closed
+    if not event_json(g.event)["paid"]:
+        return jsonify({"error": "This event needs to be paid for before it can take sales"}), 402
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "No data provided"}), 400
@@ -1377,10 +1431,61 @@ def get_shared_csv(token, name):
 @app.route("/api/events/<int:event_id>/<name>.csv", methods=["GET"])
 @event_route(manage=True)
 def get_event_csv(event_id, name):
+    if g.event["plan"] == "free":
+        return jsonify({"error": "Exports come with paid events"}), 403
     files = dict(event_files(g.event))
     if f"{name}.csv" not in files:
         return jsonify({"error": "Not found"}), 404
     return csv_response(files[f"{name}.csv"], f"{name}.csv")
+
+# ----- Paying for events -----
+
+@app.route("/api/events/<int:event_id>/checkout", methods=["POST"])
+@event_route(manage=True)
+def start_checkout(event_id):
+    """Start paying for an event. Returns the Stripe payment page to send the organizer to."""
+    if g.event["plan"] == "free":
+        return jsonify({"error": "Free events have nothing to pay"}), 400
+    if g.event["paid_at"]:
+        return jsonify({"error": "This event is already paid for"}), 409
+    try:
+        session_id, url = billing.create_checkout(g.event, g.user["email"])
+    except billing.NotConfigured:
+        return jsonify({"error": "Payments aren't set up on this site yet"}), 503
+    except Exception:
+        logger.exception("Could not start checkout for event %s", event_id)
+        return jsonify({"error": "Could not reach the payment service. Try again in a minute."}), 502
+    with get_db_connection() as conn:
+        conn.execute("UPDATE events SET stripe_session_id = %s WHERE id = %s", (session_id, event_id))
+    return jsonify({"url": url})
+
+@app.route("/api/stripe/webhook", methods=["POST"])
+def stripe_webhook():
+    """Stripe tells us here when a checkout is paid. This, not the return page, marks the event paid."""
+    try:
+        event_id = billing.paid_event_id(request.get_data(), request.headers.get("Stripe-Signature"))
+    except ValueError:
+        return jsonify({"error": "Invalid signature"}), 400
+    if event_id is not None:
+        with get_db_connection() as conn:
+            updated = conn.execute(
+                "UPDATE events SET paid_at = now() WHERE id = %s AND paid_at IS NULL", (event_id,)
+            ).rowcount
+        if updated:
+            logger.info("Event %s paid", event_id)
+    # Always acknowledge, so Stripe doesn't keep resending events we don't act on
+    return jsonify({"received": True})
+
+@app.route("/api/events/<int:event_id>/mark-paid", methods=["POST"])
+@event_route(manage=True)
+def mark_paid(event_id):
+    """Let the site owner give an event away, such as for a church that's a friend of the site."""
+    if not g.user["is_owner"]:
+        return jsonify({"error": "Only the site owner can do that"}), 403
+    with get_db_connection() as conn:
+        conn.execute("UPDATE events SET paid_at = COALESCE(paid_at, now()) WHERE id = %s", (event_id,))
+        event = load_event(conn, event_id)
+    return jsonify(event_json(event))
 
 # ----- Accounts, invites and password resets -----
 
@@ -1465,8 +1570,8 @@ def accept_invite(token):
             return jsonify({"error": str(e)}), 400
         try:
             user = conn.execute(
-                """INSERT INTO users (email, name, password_hash) VALUES (%s, %s, %s)
-                   RETURNING id, password_hash""",
+                """INSERT INTO users (email, name, password_hash, email_verified_at)
+                   VALUES (%s, %s, %s, now()) RETURNING id, password_hash""",
                 (invite["email"], name, generate_password_hash(password)),
             ).fetchone()
         except psycopg.errors.UniqueViolation:
@@ -1474,6 +1579,86 @@ def accept_invite(token):
         conn.execute("DELETE FROM invites WHERE email = %s", (invite["email"],))
     start_session("organizer", user=user)
     return jsonify({"authenticated": True, **current_user()}), 201
+
+
+def send_verification(conn, user_id, email):
+    token, token_hash = new_token()
+    conn.execute("DELETE FROM email_verifications WHERE user_id = %s", (user_id,))
+    conn.execute(
+        "INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES (%s, %s, now() + %s)",
+        (user_id, token_hash, VERIFY_LIFETIME),
+    )
+    return lambda: mail.send(
+        email,
+        "Confirm your email for SplitTheSale",
+        f"Thanks for signing up for SplitTheSale.\n\n"
+        f"Confirm your email to finish:\n{PUBLIC_URL}/verify/{token}\n\n"
+        f"This link works once and expires in a day. If you didn't sign up, ignore this email.",
+    )
+
+SIGNUP_MESSAGE = "Check your email for a link to finish signing up."
+
+@app.route("/api/signup", methods=["POST"])
+def signup():
+    """Make an account that can log in once its email is confirmed.
+
+    The answer is the same if the email already has an account, so sign-up can't be
+    used to find out who has one.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        email = clean_email(data.get("email"))
+        name = clean_text(data.get("name"), "Name")
+        password = clean_password(data.get("password"))
+    except (ValueError, AttributeError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    send = None
+    with get_db_connection() as conn:
+        user = conn.execute(
+            """INSERT INTO users (email, name, password_hash) VALUES (%s, %s, %s)
+               ON CONFLICT (email) DO NOTHING RETURNING id""",
+            (email, name, generate_password_hash(password)),
+        ).fetchone()
+        if user:
+            send = send_verification(conn, user["id"], email)
+    if send:
+        send()
+    return jsonify({"message": SIGNUP_MESSAGE}), 201
+
+@app.route("/api/signup/resend", methods=["POST"])
+def resend_verification():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email") if isinstance(data, dict) else None
+    send = None
+    if isinstance(email, str):
+        with get_db_connection() as conn:
+            user = conn.execute(
+                "SELECT id, email FROM users WHERE email = %s AND email_verified_at IS NULL",
+                (email.strip().lower(),),
+            ).fetchone()
+            if user:
+                send = send_verification(conn, user["id"], user["email"])
+    if send:
+        send()
+    return jsonify({"message": SIGNUP_MESSAGE})
+
+@app.route("/api/verify/<token>", methods=["POST"])
+def verify_email(token):
+    with get_db_connection() as conn:
+        found = conn.execute(
+            "DELETE FROM email_verifications WHERE token_hash = %s AND expires_at > now() RETURNING user_id",
+            (hash_token(token),),
+        ).fetchone()
+        if not found:
+            return jsonify({"error": "This link has expired or was already used"}), 400
+        user = conn.execute(
+            """UPDATE users SET email_verified_at = now() WHERE id = %s
+               RETURNING id, password_hash""",
+            (found["user_id"],),
+        ).fetchone()
+    start_session("organizer", user=user)
+    return jsonify({"authenticated": True, **current_user()})
 
 @app.route("/api/password-reset", methods=["POST"])
 def request_password_reset():
@@ -1538,11 +1723,15 @@ def create_owner_command(email, name):
         raise click.ClickException(str(e)) from None
     with get_db_connection() as conn:
         updated = conn.execute(
-            "UPDATE users SET password_hash = %s, is_owner = TRUE WHERE email = %s", (password_hash, email)
+            """UPDATE users SET password_hash = %s, is_owner = TRUE,
+                   email_verified_at = COALESCE(email_verified_at, now())
+               WHERE email = %s""",
+            (password_hash, email),
         ).rowcount
         if not updated:
             conn.execute(
-                "INSERT INTO users (email, name, password_hash, is_owner) VALUES (%s, %s, %s, TRUE)",
+                """INSERT INTO users (email, name, password_hash, is_owner, email_verified_at)
+                   VALUES (%s, %s, %s, TRUE, now())""",
                 (email, name, password_hash),
             )
     click.echo(f"{'Updated' if updated else 'Created'} site owner {email}.")
@@ -1573,22 +1762,26 @@ def purge_expired_command():
         logger.info("Purged event %s (%s)", event["id"], event["name"])
     click.echo(f"Closed {len(idle)} idle event(s). Deleted {len(deleted)} event(s).")
 
-# Serve frontend app (if built) for SPA routes
+# The landing page is the site's front door, and the app (app.html) is under /app.
+# Links handed out to people (a cashier's login, an invite, a password reset, an
+# email confirmation and a shared report) open the app directly.
+@app.route("/app")
+@app.route("/app/")
+@app.route("/signup")
+@app.route("/e/<token>")
+@app.route("/invite/<token>")
+@app.route("/reset/<token>")
+@app.route("/verify/<token>")
+@app.route("/r/<token>")
+def serve_app(token=None):
+    return send_from_directory(app.static_folder, "app.html")
+
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_frontend(path):
     if app.static_folder and (path == "" or not os.path.exists(os.path.join(app.static_folder, path))):
         return send_from_directory(app.static_folder, "index.html")
     return send_from_directory(app.static_folder, path)
-
-# Links handed out to people: a cashier's login, an invite, a password reset and a
-# shared report. Flask's static route would otherwise answer them with a 404.
-@app.route("/e/<token>")
-@app.route("/invite/<token>")
-@app.route("/reset/<token>")
-@app.route("/r/<token>")
-def frontend_link(token):
-    return send_from_directory(app.static_folder, "index.html")
 
 if __name__ == "__main__":
     # Only used when running directly with python app.py

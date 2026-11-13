@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react";
-import { MODE_LABELS, sendJson } from "./format";
+import { MODE_LABELS, PRICES, sendJson } from "./format";
 
 function Events({ api, onOpen, showOwner }) {
   const [events, setEvents] = useState([]);
   const [error, setError] = useState("");
   const [name, setName] = useState("");
-  const [mode, setMode] = useState("yard_sale");
+  // "free", or the mode of a paid event
+  const [kind, setKind] = useState("free");
 
   const load = async () => {
     const response = await api("/api/events");
@@ -28,7 +29,8 @@ function Events({ api, onOpen, showOwner }) {
     e.preventDefault();
     setError("");
     try {
-      const response = await api("/api/events", sendJson("POST", { name, mode }));
+      const body = kind === "free" ? { name, plan: "free" } : { name, plan: "paid", mode: kind };
+      const response = await api("/api/events", sendJson("POST", body));
       const result = await response.json();
       if (!response.ok) {
         setError(result.error || "Could not create the event");
@@ -56,10 +58,12 @@ function Events({ api, onOpen, showOwner }) {
           </label>
           <label>
             Kind
-            <select value={mode} onChange={(e) => setMode(e.target.value)}>
+            <select value={kind} onChange={(e) => setKind(e.target.value)}>
+              <option value="free">Free sale (just you, cleared at midnight)</option>
               {Object.entries(MODE_LABELS).map(([value, label]) => (
                 <option key={value} value={value}>
                   {label}
+                  {showOwner ? "" : ` (${PRICES[value]})`}
                 </option>
               ))}
             </select>
@@ -78,7 +82,8 @@ function Events({ api, onOpen, showOwner }) {
             <div>
               <span className="cashier-name">{event.name}</span>
               <div className="report-note">
-                {MODE_LABELS[event.mode]}, code {event.code},{" "}
+                {event.plan === "free" ? "Free sale" : MODE_LABELS[event.mode]}
+                {!event.paid && ", not paid yet"}, code {event.code},{" "}
                 {event.status === "open" ? "open" : "closed"}, created{" "}
                 {new Date(event.created_at).toLocaleDateString()}
                 {showOwner && `, ${event.owner_email ?? "no owner"}`}

@@ -11,6 +11,9 @@ function Login({ onLogin }) {
   const linked = linkedEventCode() !== "";
   const [organizer, setOrganizer] = useState(!linked);
   const [forgot, setForgot] = useState(false);
+  const [signingUp, setSigningUp] = useState(window.location.pathname === "/signup");
+  const [unverified, setUnverified] = useState(false);
+  const [name, setName] = useState("");
   const [eventCode, setEventCode] = useState(linkedEventCode);
   const [code, setCode] = useState("");
   const [email, setEmail] = useState("");
@@ -24,8 +27,19 @@ function Login({ onLogin }) {
     setSubmitting(true);
     setError("");
     setMessage("");
+    setUnverified(false);
     try {
-      if (forgot) {
+      if (signingUp) {
+        const response = await fetch("/api/signup", sendJson("POST", { email, name, password }));
+        const result = await response.json();
+        if (response.ok) {
+          setMessage(result.message);
+          setSigningUp(false);
+          setPassword("");
+        } else {
+          setError(result.error || "Could not sign up");
+        }
+      } else if (forgot) {
         const response = await fetch("/api/password-reset", sendJson("POST", { email }));
         setMessage((await response.json()).message);
         setForgot(false);
@@ -38,6 +52,7 @@ function Login({ onLogin }) {
           return;
         }
         setError(result.error || "Could not log in");
+        setUnverified(Boolean(result.unverified));
         setCode("");
         setPassword("");
       }
@@ -48,16 +63,24 @@ function Login({ onLogin }) {
     setSubmitting(false);
   };
 
+  const resend = async () => {
+    const response = await fetch("/api/signup/resend", sendJson("POST", { email }));
+    setError("");
+    setUnverified(false);
+    setMessage((await response.json()).message);
+  };
+
   const switchTo = (toOrganizer) => {
     setOrganizer(toOrganizer);
     setForgot(false);
+    setSigningUp(false);
     setError("");
     setMessage("");
   };
 
   return (
     <div className="login-container">
-      <h1>Sale POS</h1>
+      <h1>SplitTheSale</h1>
       {!linked && (
         <div className="department-tabs">
           <button className={`tab-button ${!organizer ? "active" : ""}`} onClick={() => switchTo(false)}>
@@ -71,6 +94,12 @@ function Login({ onLogin }) {
       <form className="login-form" onSubmit={submit}>
         {organizer ? (
           <>
+            {signingUp && (
+              <>
+                <label htmlFor="name">Your name</label>
+                <input id="name" maxLength={50} value={name} onChange={(e) => setName(e.target.value)} />
+              </>
+            )}
             <label htmlFor="email">Email</label>
             <input
               id="email"
@@ -82,11 +111,13 @@ function Login({ onLogin }) {
             />
             {!forgot && (
               <>
-                <label htmlFor="password">Password</label>
+                <label htmlFor="password">
+                  {signingUp ? "Password (at least 10 characters)" : "Password"}
+                </label>
                 <input
                   id="password"
                   type="password"
-                  autoComplete="current-password"
+                  autoComplete={signingUp ? "new-password" : "current-password"}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                 />
@@ -95,12 +126,25 @@ function Login({ onLogin }) {
             <button
               type="submit"
               className="checkout-btn"
-              disabled={submitting || !email || (!forgot && !password)}
+              disabled={submitting || !email || (!forgot && !password) || (signingUp && !name)}
             >
-              {forgot ? "Email Me a Reset Link" : "Log In"}
+              {signingUp ? "Sign Up" : forgot ? "Email Me a Reset Link" : "Log In"}
             </button>
-            <button type="button" className="tab-button" onClick={() => setForgot(!forgot)}>
-              {forgot ? "Back to Log In" : "Forgot password?"}
+            {!signingUp && (
+              <button type="button" className="tab-button" onClick={() => setForgot(!forgot)}>
+                {forgot ? "Back to Log In" : "Forgot password?"}
+              </button>
+            )}
+            <button
+              type="button"
+              className="tab-button"
+              onClick={() => {
+                setSigningUp(!signingUp);
+                setForgot(false);
+                setError("");
+              }}
+            >
+              {signingUp ? "Have an account? Log in" : "New here? Sign up"}
             </button>
           </>
         ) : (
@@ -140,6 +184,11 @@ function Login({ onLogin }) {
           </>
         )}
         {error && <div className="login-error">{error}</div>}
+        {unverified && (
+          <button type="button" className="tab-button" onClick={resend}>
+            Send the link again
+          </button>
+        )}
         {message && <div className="message">{message}</div>}
       </form>
       <p className="report-note privacy-note">

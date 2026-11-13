@@ -16,6 +16,10 @@ x-app-environment: &app-environment
   SMTP_USER: ${SMTP_USER:-}
   SMTP_PASSWORD: ${SMTP_PASSWORD:-}
   SMTP_FROM: ${SMTP_FROM:-}
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+  STRIPE_PRICE_YARD_SALE: ${STRIPE_PRICE_YARD_SALE:-}
+  STRIPE_PRICE_CHARITY: ${STRIPE_PRICE_CHARITY:-}
 
 services:
   db:
@@ -43,14 +47,15 @@ services:
     environment: *app-environment
     restart: unless-stopped
 
-  # Once a day: close events idle for 60 days, and delete events 6 months after they close
+  # Every hour: delete free sales after midnight, close events idle for 60 days, and
+  # delete events 6 months after they close
   purger:
     build: .
     depends_on:
       db:
         condition: service_healthy
     environment: *app-environment
-    command: ["sh", "-c", "while true; do flask --app app purge-expired; sleep 86400; done"]
+    command: ["sh", "-c", "while true; do flask --app app purge-expired; sleep 3600; done"]
     healthcheck:
       disable: true
     restart: unless-stopped

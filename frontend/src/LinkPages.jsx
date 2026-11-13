@@ -45,7 +45,7 @@ export function AcceptInvite({ token, onLogin }) {
 
   return (
     <div className="login-container">
-      <h1>Sale POS</h1>
+      <h1>SplitTheSale</h1>
       <form className="login-form" onSubmit={submit}>
         {email && <p className="report-note">Creating an account for {email}</p>}
         <label htmlFor="name">Your name</label>
@@ -86,7 +86,7 @@ export function ResetPassword({ token }) {
 
   return (
     <div className="login-container">
-      <h1>Sale POS</h1>
+      <h1>SplitTheSale</h1>
       {done ? (
         <div className="login-form">
           <p>Your password is changed.</p>
@@ -110,6 +110,43 @@ export function ResetPassword({ token }) {
           {error && <div className="login-error">{error}</div>}
         </form>
       )}
+    </div>
+  );
+}
+
+export function VerifyEmail({ token, onLogin }) {
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    postJson(`/api/verify/${token}`, {})
+      .then(({ ok, result }) => {
+        if (ok) {
+          window.history.replaceState(null, "", "/app");
+          onLogin(result);
+        } else {
+          setError(result.error || "This link isn't valid");
+        }
+      })
+      .catch(() => setError("Error connecting to server"));
+    // Confirm once, even if the parent re-renders
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
+  return (
+    <div className="login-container">
+      <h1>SplitTheSale</h1>
+      <div className="login-form">
+        {error ? (
+          <>
+            <p className="login-error">{error}</p>
+            <a className="checkout-btn" href="/app">
+              Log In
+            </a>
+          </>
+        ) : (
+          <p>Confirming your email...</p>
+        )}
+      </div>
     </div>
   );
 }

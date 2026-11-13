@@ -1,11 +1,13 @@
 import { useState } from "react";
 import Cashiers from "./Cashiers";
-import { MODE_LABELS, sendJson } from "./format";
+import { MODE_LABELS, PRICES, sendJson } from "./format";
 
 const KINDS = ["cash", "check", "venmo", "card", "other"];
 
-function EventSetup({ api, event, onChanged, onDeleted }) {
+function EventSetup({ api, event, isOwner, onChanged, onDeleted }) {
   const yardSale = event.mode === "yard_sale";
+  const free = event.plan === "free";
+  const [paying, setPaying] = useState(false);
   const base = `/api/events/${event.id}`;
   const link = `${window.location.origin}/e/${event.code}`;
   const [error, setError] = useState("");
@@ -84,12 +86,57 @@ function EventSetup({ api, event, onChanged, onDeleted }) {
     else setError("Could not delete the event");
   };
 
+  const pay = async () => {
+    setPaying(true);
+    setError("");
+    try {
+      const response = await api(`${base}/checkout`, { method: "POST" });
+      const result = await response.json();
+      if (response.ok) {
+        // Stripe's payment page brings them back to /app?paid=<event id>
+        window.location.href = result.url;
+        return;
+      }
+      setError(result.error || "Could not start the payment");
+    } catch (error) {
+      console.error("Error:", error);
+      setError("Error connecting to server");
+    }
+    setPaying(false);
+  };
+
   const sellerName = (id) => event.sellers.find((s) => s.id === id)?.name;
   const rows = yardSale ? event.sellers : event.items;
 
   return (
     <div className="cashiers">
       {error && <div className="login-error">{error}</div>}
+
+      {!event.paid && (
+        <section className="report-section pay-banner">
+          <h3>Pay to start selling</h3>
+          <p className="report-note">
+            Set everything up first if you like. Cashiers can't ring up sales until the
+            event is paid for. If you just paid, it can take a few seconds to show here.
+          </p>
+          <div className="cashier-actions">
+            <button className="checkout-btn" onClick={pay} disabled={paying}>
+              {paying ? "Opening Stripe..." : `Pay ${PRICES[event.mode]} with Stripe`}
+            </button>
+            <button className="tab-button" onClick={onChanged}>
+              Check Again
+            </button>
+            {isOwner && (
+              <button
+                className="tab-button"
+                onClick={() => request(`${base}/mark-paid`, { method: "POST" })}
+              >
+                Give It Free
+              </button>
+            )}
+          </div>
+        </section>
+      )}
 
       <section className="report-section">
         <h3>Event</h3>
@@ -102,21 +149,30 @@ function EventSetup({ api, event, onChanged, onDeleted }) {
             Rename
           </button>
         </form>
-        <p className="report-note">
-          {MODE_LABELS[event.mode]}. Cashiers log in at <strong>{link}</strong> (event
-          code {event.code}).
-        </p>
-        {event.purge_after && (
+        {free ? (
+          <p className="report-note">
+            Free sale. You ring up the sales yourself, and everything is deleted at{" "}
+            {new Date(event.purge_after).toLocaleString()}.
+          </p>
+        ) : (
+          <p className="report-note">
+            {MODE_LABELS[event.mode]}. Cashiers log in at <strong>{link}</strong> (event
+            code {event.code}).
+          </p>
+        )}
+        {!free && event.purge_after && (
           <p className="report-note">
             Closed. This event and every sale in it will be permanently deleted on{" "}
             {new Date(event.purge_after).toLocaleDateString()}. Download a copy to keep it.
           </p>
         )}
         <div className="cashier-actions">
-          <a className="tab-button" href={`${base}/sales.csv`}>
-            Download Sales CSV
-          </a>
-          {yardSale && (
+          {!free && (
+            <a className="tab-button" href={`${base}/sales.csv`}>
+              Download Sales CSV
+            </a>
+          )}
+          {yardSale && !free && (
             <a className="tab-button" href={`${base}/payouts.csv`}>
               Download Payouts CSV
             </a>
@@ -136,7 +192,7 @@ function EventSetup({ api, event, onChanged, onDeleted }) {
         </div>
       </section>
 
-      <section className="report-section">
+      {!free && <section className="report-section">
         <h3>{yardSale ? "Sellers" : "Items"}</h3>
         {yardSale && (
           <p className="report-note">The people or families whose things are for sale.</p>
@@ -177,11 +233,11 @@ function EventSetup({ api, event, onChanged, onDeleted }) {
             </div>
           </div>
         ))}
-      </section>
+      </section>}
 
       <section className="report-section">
         <h3>Payment Methods</h3>
-        {yardSale && (
+        {yardSale && !free && (
           <p className="report-note">
             Pick whose account the money goes to, such as Mary's Venmo. Money paid
             to the cash box is shared out at the end.
@@ -202,7 +258,7 @@ function EventSetup({ api, event, onChanged, onDeleted }) {
               ))}
             </select>
           </label>
-          {yardSale && (
+          {yardSale && !free && (
             <label>
               Money goes to
               <select value={holder} onChange={(e) => setHolder(e.target.value)}>
@@ -223,7 +279,7 @@ function EventSetup({ api, event, onChanged, onDeleted }) {
           <div key={method.id} className="cashier-row">
             <span className="cashier-name">
               {method.label}
-              {yardSale && (
+              {yardSale && !free && (
                 <span className="report-note">
                   {" "}
                   (goes to {sellerName(method.holder_seller_id) ?? "cash box"})
@@ -242,8 +298,12 @@ function EventSetup({ api, event, onChanged, onDeleted }) {
         ))}
       </section>
 
-      <h3>Cashiers</h3>
-      <Cashiers api={api} eventId={event.id} />
+      {!free && (
+        <>
+          <h3>Cashiers</h3>
+          <Cashiers api={api} eventId={event.id} />
+        </>
+      )}
     </div>
   );
 }

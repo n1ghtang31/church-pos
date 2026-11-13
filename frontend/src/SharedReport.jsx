@@ -20,7 +20,7 @@ function SharedReport({ token }) {
   if (error) {
     return (
       <div className="login-container">
-        <h1>Sale POS</h1>
+        <h1>SplitTheSale</h1>
         <p className="login-error">{error}</p>
         <p className="report-note">
           Event reports are deleted 6 months after the event closes.

@@ -11,6 +11,10 @@ export const toCents = (text) => {
 
 export const MODE_LABELS = { charity: "Charity drive", yard_sale: "Yard sale" };
 
+// What a paid event costs. The real prices are set in Stripe, so keep these and the
+// landing page in step with it.
+export const PRICES = { yard_sale: "$10", charity: "$30" };
+
 // Today's date in the browser's timezone, as YYYY-MM-DD
 export const today = () => new Date().toLocaleDateString("en-CA");
 

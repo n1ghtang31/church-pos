@@ -1,6 +1,13 @@
+import hashlib
+import hmac
+import json
 import os
 import re
+import tempfile
+import time
 import unittest
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # These tests empty every table, so they only run against a database set aside for them
 if not os.environ.get("TEST_DATABASE_URL"):
@@ -9,6 +16,15 @@ os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 os.environ["SECRET_KEY"] = "test-secret"
 os.environ["PUBLIC_URL"] = "https://sales.example.com"
 os.environ.pop("SMTP_HOST", None)
+os.environ.pop("STRIPE_SECRET_KEY", None)
+os.environ["STRIPE_WEBHOOK_SECRET"] = "whsec_test"
+
+# Stand-ins for the built landing page and app
+_static = tempfile.TemporaryDirectory()
+for _name, _text in [("index.html", "<h1>SplitTheSale landing</h1>"), ("app.html", "<div id=root>app</div>")]:
+    with open(os.path.join(_static.name, _name), "w") as _file:
+        _file.write(_text)
+os.environ["FLASK_STATIC_DIR"] = _static.name
 
 import app as pos
 
@@ -37,6 +53,8 @@ class PosTestCase(unittest.TestCase):
         self.admin = self.user_client("olive@example.com", ORGANIZER_PASSWORD)
         self.event = self.admin.post("/api/events", json={"name": "Drive", "mode": self.MODE}).json
         self.base = f"/api/events/{self.event['id']}"
+        # Paid for, so sales can be rung up
+        sql("UPDATE events SET paid_at = now() WHERE id = %s", (self.event["id"],))
         self.admin.post(f"{self.base}/cashiers", json={"name": "Pat", "pin": "123456"})
         self.methods = {m["label"]: m["id"] for m in self.admin.get(self.base).json["payment_methods"]}
 
@@ -768,6 +786,208 @@ class PurgeTests(PosTestCase):
         self.run_purge()
         self.assertEqual(sql("SELECT count(*) AS n FROM invites")[0]["n"], 0)
         self.assertEqual(sql("SELECT count(*) AS n FROM password_resets")[0]["n"], 0)
+
+
+
+class SignupTests(PosTestCase):
+    def signup(self, **body):
+        body = {"email": "sam@example.com", "name": "Sam", "password": "sam-password-1", **body}
+        return pos.app.test_client().post("/api/signup", json=body)
+
+    def login(self, email="sam@example.com", password="sam-password-1"):
+        return pos.app.test_client().post("/api/login", json={"email": email, "password": password})
+
+    def test_signup_needs_email_verification(self):
+        response = self.signup()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.outbox[-1]["To"], "sam@example.com")
+        refused = self.login()
+        self.assertEqual(refused.status_code, 403)
+        self.assertTrue(refused.json["unverified"])
+
+        token = link_token(self.outbox[-1], "verify")
+        client = pos.app.test_client()
+        verified = client.post(f"/api/verify/{token}")
+        self.assertEqual(verified.status_code, 200)
+        self.assertEqual(client.get("/api/session").json["email"], "sam@example.com")
+        self.assertEqual(self.login().status_code, 200)
+        # Each link works once
+        self.assertEqual(pos.app.test_client().post(f"/api/verify/{token}").status_code, 400)
+
+    def test_existing_email_gets_same_answer(self):
+        response = self.signup(email="Olive@example.com")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.outbox, [])
+        self.assertEqual(sql("SELECT name FROM users WHERE email = 'olive@example.com'")[0]["name"], "Olive")
+
+    def test_invalid_signups_rejected(self):
+        for body in [{"email": "nope"}, {"password": "short"}, {"name": ""}]:
+            self.assertEqual(self.signup(**body).status_code, 400, body)
+        self.assertEqual(sql("SELECT count(*) AS n FROM users")[0]["n"], 2)
+
+    def test_resend_and_expired_links(self):
+        self.signup()
+        sql("UPDATE email_verifications SET expires_at = now() - interval '1 minute'")
+        old = link_token(self.outbox[-1], "verify")
+        self.assertEqual(pos.app.test_client().post(f"/api/verify/{old}").status_code, 400)
+
+        resend = pos.app.test_client().post("/api/signup/resend", json={"email": "sam@example.com"})
+        self.assertEqual(resend.status_code, 200)
+        new = link_token(self.outbox[-1], "verify")
+        self.assertEqual(pos.app.test_client().post(f"/api/verify/{new}").status_code, 200)
+
+        # Nothing is sent for verified or unknown addresses
+        sent = len(self.outbox)
+        for email in ["sam@example.com", "nobody@example.com"]:
+            pos.app.test_client().post("/api/signup/resend", json={"email": email})
+        self.assertEqual(len(self.outbox), sent)
+
+    def test_invited_people_are_already_verified(self):
+        self.owner.post("/api/invites", json={"email": "nina@example.com"})
+        token = link_token(self.outbox[-1], "invite")
+        pos.app.test_client().post(f"/api/invites/accept/{token}", json={"name": "Nina", "password": "nina-password-1"})
+        self.assertEqual(self.login("nina@example.com", "nina-password-1").status_code, 200)
+
+
+class FreeEventTests(PosTestCase):
+    def create_free(self, **body):
+        return self.admin.post("/api/events", json={"name": "Garage", "plan": "free", **body})
+
+    def test_free_event_is_a_one_seller_yard_sale_until_midnight(self):
+        event = self.create_free().json
+        self.assertEqual((event["plan"], event["mode"]), ("free", "yard_sale"))
+        setup = self.admin.get(f"/api/events/{event['id']}").json
+        self.assertEqual([s["name"] for s in setup["sellers"]], ["Olive"])
+
+        purge = datetime.fromisoformat(event["purge_after"]).astimezone(ZoneInfo(event["timezone"]))
+        self.assertEqual((purge.hour, purge.minute), (0, 0))
+        self.assertLessEqual(purge - datetime.now(purge.tzinfo), timedelta(hours=25))
+
+    def test_free_must_be_a_yard_sale_and_one_at_a_time(self):
+        self.assertEqual(self.create_free(mode="charity").status_code, 400)
+        self.assertEqual(self.create_free().status_code, 201)
+        self.assertEqual(self.create_free().status_code, 409)
+
+    def test_organizer_rings_up_free_sales_without_paying(self):
+        event = self.create_free().json
+        base = f"/api/events/{event['id']}"
+        setup = self.admin.get(base).json
+        response = self.admin.post(f"{base}/sales", json={
+            "payment_method_id": setup["payment_methods"][0]["id"],
+            "lines": [{"seller_id": setup["sellers"][0]["id"], "price_cents": 500}],
+        })
+        self.assertEqual(response.status_code, 201, response.json)
+        self.assertEqual(response.json["cashier"], "Olive")
+
+    def test_free_event_has_no_cashiers_sellers_or_exports(self):
+        base = f"/api/events/{self.create_free().json['id']}"
+        self.assertEqual(self.admin.post(f"{base}/cashiers", json={"name": "Pat", "pin": "4321"}).status_code, 400)
+        self.assertEqual(self.admin.post(f"{base}/sellers", json={"name": "Mary"}).status_code, 400)
+        self.assertEqual(self.admin.get(f"{base}/sales.csv").status_code, 403)
+        self.admin.post(f"{base}/close")
+        self.assertEqual(self.outbox, [])
+
+    def test_free_event_deleted_after_midnight(self):
+        event = self.create_free().json
+        sql("UPDATE events SET purge_after = now() - interval '1 minute' WHERE id = %s", (event["id"],))
+        pos.app.test_cli_runner().invoke(args=["purge-expired"])
+        self.assertEqual([e["id"] for e in self.admin.get("/api/events").json], [self.event["id"]])
+        self.assertEqual(self.create_free().status_code, 201)
+
+
+class PaymentTests(PosTestCase):
+    def setUp(self):
+        super().setUp()
+        self.unpaid = self.admin.post("/api/events", json={"name": "Big Sale", "mode": "yard_sale"}).json
+        self.unpaid_base = f"/api/events/{self.unpaid['id']}"
+        self.original_checkout = pos.billing.create_checkout
+        self.checkouts = []
+
+        def fake_checkout(event, email):
+            self.checkouts.append((event["id"], event["mode"], email))
+            return "cs_test_123", "https://checkout.stripe.com/c/pay/cs_test_123"
+        pos.billing.create_checkout = fake_checkout
+
+    def tearDown(self):
+        pos.billing.create_checkout = self.original_checkout
+
+    def webhook(self, event_id, kind="checkout.session.completed", payment_status="paid", secret="whsec_test"):
+        payload = json.dumps({
+            "id": "evt_test",
+            "type": kind,
+            "data": {"object": {"id": "cs_test_123", "object": "checkout.session", "payment_status": payment_status,
+                                "metadata": {"event_id": str(event_id)}}},
+        })
+        timestamp = int(time.time())
+        signature = hmac.new(secret.encode(), f"{timestamp}.{payload}".encode(), hashlib.sha256).hexdigest()
+        return pos.app.test_client().post(
+            "/api/stripe/webhook", data=payload, content_type="application/json",
+            headers={"Stripe-Signature": f"t={timestamp},v1={signature}"},
+        )
+
+    def sell_in_unpaid(self):
+        seller = self.admin.post(f"{self.unpaid_base}/sellers", json={"name": "Mary"}).json["id"]
+        self.admin.post(f"{self.unpaid_base}/cashiers", json={"name": "Pat", "pin": "4321"})
+        cash = self.admin.get(self.unpaid_base).json["payment_methods"][0]["id"]
+        client = self.cashier("4321", self.unpaid)
+        return client.post(f"{self.unpaid_base}/sales",
+                           json={"payment_method_id": cash, "lines": [{"seller_id": seller, "price_cents": 500}]})
+
+    def test_unpaid_event_can_be_set_up_but_not_sell(self):
+        self.assertFalse(self.unpaid["paid"])
+        self.assertEqual(self.sell_in_unpaid().status_code, 402)
+
+    def test_checkout_returns_stripe_url(self):
+        response = self.admin.post(f"{self.unpaid_base}/checkout")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["url"], "https://checkout.stripe.com/c/pay/cs_test_123")
+        self.assertEqual(self.checkouts, [(self.unpaid["id"], "yard_sale", "olive@example.com")])
+        self.assertEqual(self.admin.post(f"{self.base}/checkout").status_code, 409)
+        self.assertEqual(self.cashier().post(f"{self.base}/checkout").status_code, 403)
+
+    def test_checkout_without_stripe_configured(self):
+        pos.billing.create_checkout = self.original_checkout
+        self.assertEqual(self.admin.post(f"{self.unpaid_base}/checkout").status_code, 503)
+
+    def test_webhook_marks_event_paid(self):
+        self.assertEqual(self.webhook(self.unpaid["id"]).status_code, 200)
+        self.assertTrue(self.admin.get(self.unpaid_base).json["paid"])
+        self.assertEqual(self.sell_in_unpaid().status_code, 201)
+
+    def test_webhook_ignores_bad_signatures_and_other_events(self):
+        self.assertEqual(self.webhook(self.unpaid["id"], secret="whsec_wrong").status_code, 400)
+        self.assertEqual(self.webhook(self.unpaid["id"], payment_status="unpaid").status_code, 200)
+        self.assertEqual(self.webhook(self.unpaid["id"], kind="customer.created").status_code, 200)
+        self.assertEqual(self.webhook(99999).status_code, 200)
+        self.assertFalse(self.admin.get(self.unpaid_base).json["paid"])
+
+    def test_webhook_refused_without_a_secret_configured(self):
+        pos.billing.STRIPE_WEBHOOK_SECRET = ""
+        try:
+            self.assertEqual(self.webhook(self.unpaid["id"], secret="").status_code, 400)
+        finally:
+            pos.billing.STRIPE_WEBHOOK_SECRET = "whsec_test"
+        self.assertFalse(self.admin.get(self.unpaid_base).json["paid"])
+
+    def test_owner_events_are_free_and_owner_can_mark_paid(self):
+        mine = self.owner.post("/api/events", json={"name": "Church Drive", "mode": "charity"}).json
+        self.assertTrue(mine["paid"])
+        self.assertEqual(self.admin.post(f"{self.unpaid_base}/mark-paid").status_code, 403)
+        self.assertTrue(self.owner.post(f"{self.unpaid_base}/mark-paid").json["paid"])
+
+    def test_free_event_has_nothing_to_pay(self):
+        free = self.admin.post("/api/events", json={"name": "Garage", "plan": "free"}).json
+        self.assertEqual(self.admin.post(f"/api/events/{free['id']}/checkout").status_code, 400)
+
+
+class PageTests(unittest.TestCase):
+    def test_landing_page_at_root_and_app_under_app(self):
+        client = pos.app.test_client()
+        self.assertIn(b"SplitTheSale landing", client.get("/").data)
+        for path in ["/app", "/app/", "/e/ABC123", "/invite/x", "/reset/x", "/r/x", "/verify/x", "/signup"]:
+            response = client.get(path)
+            self.assertEqual(response.status_code, 200, path)
+            self.assertIn(b"app", response.data, path)
 
 
 if __name__ == "__main__":

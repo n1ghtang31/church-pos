@@ -2,12 +2,175 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>frontend</title>
+    <title>SplitTheSale: a register for yard sales and charity drives</title>
+    <meta
+      name="description"
+      content="Ring up multi-family yard sales and charity drives from any phone. SplitTheSale tracks whose stuff sold, splits bundle deals fairly, and tells everyone who pays whom at the end."
+    />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <link rel="stylesheet" href="/src/landing.css" />
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
+    <header class="top">
+      <div class="wrap top-inner">
+        <a class="brand" href="/">SplitTheSale</a>
+        <nav>
+          <a href="#pricing">Pricing</a>
+          <a href="/app">Log in</a>
+          <a class="button small" href="/signup">Sign up</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="wrap">
+          <h1>The register for yard sales where everyone gets their fair share.</h1>
+          <p class="lead">
+            Johnny's tools, Mary's dishes and Paul's old bike, all on one table. Ring up
+            each sale on your phone and SplitTheSale keeps track of whose stuff sold,
+            splits "$30 for the lot" deals fairly, and tells everyone who pays whom when
+            the day is done.
+          </p>
+          <div class="actions">
+            <a class="button" href="/signup">Start a free sale</a>
+            <a class="button ghost" href="#how">See how it works</a>
+          </div>
+          <p class="fine">No app to install. Works in any phone or tablet browser.</p>
+        </div>
+      </section>
+
+      <section id="how" class="wrap section">
+        <h2>How it works</h2>
+        <ol class="steps">
+          <li>
+            <h3>Set up your sale</h3>
+            <p>
+              Add the families selling, and say where money goes: the cash box, or
+              straight into someone's Venmo.
+            </p>
+          </li>
+          <li>
+            <h3>Ring it up</h3>
+            <p>
+              Tap whose item it is and type the price. Got an offer for the whole pile?
+              Tap <strong>Set Total</strong> and the discount is shared out fairly.
+            </p>
+          </li>
+          <li>
+            <h3>Settle up</h3>
+            <p>
+              At the end, SplitTheSale shows exactly who pays whom, so nobody's doing math
+              on the back of a receipt.
+            </p>
+          </li>
+        </ol>
+      </section>
+
+      <section class="section example">
+        <div class="wrap example-inner">
+          <div>
+            <h2>A bundle deal, split fairly</h2>
+            <p>
+              A shopper picks up $50 of stuff from three families and offers $30, paid to
+              Mary's Venmo. SplitTheSale gives each family their share of the $30 and
+              tells Mary what to pass along.
+            </p>
+          </div>
+          <table class="split">
+            <thead>
+              <tr><th>Seller</th><th>Asking</th><th>Gets</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Johnny</td><td>$10.00</td><td>$6.00</td></tr>
+              <tr><td>Paul</td><td>$15.00</td><td>$9.00</td></tr>
+              <tr><td>Mary</td><td>$25.00</td><td>$15.00</td></tr>
+            </tbody>
+            <tfoot>
+              <tr><td colspan="3">Mary pays Paul $9.00 and Johnny $6.00</td></tr>
+            </tfoot>
+          </table>
+        </div>
+      </section>
+
+      <section class="wrap section">
+        <h2>Two kinds of sale</h2>
+        <div class="cards">
+          <article class="card">
+            <h3>Multi-family yard sales</h3>
+            <p>
+              Track sales by seller, take cash, Venmo or anything else, and get a payout
+              list at the end. Great for neighborhood, garage and consignment sales.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Charity drives</h3>
+            <p>
+              Set up your own items and departments, give each volunteer their own PIN,
+              and get daily totals by item, payment and cashier. Built for church and
+              school fundraisers.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section id="pricing" class="wrap section">
+        <h2>Pricing</h2>
+        <p class="lead">Pay once per event. No subscriptions.</p>
+        <div class="cards pricing">
+          <article class="card">
+            <h3>Free</h3>
+            <p class="price">$0</p>
+            <ul>
+              <li>A quick one-person sale</li>
+              <li>Running total and simple report</li>
+              <li>Cleared at midnight, nothing kept</li>
+            </ul>
+            <a class="button ghost" href="/signup">Start free</a>
+          </article>
+          <article class="card featured">
+            <h3>Yard sale</h3>
+            <p class="price">$10 <span>per sale</span></p>
+            <ul>
+              <li>As many sellers and helpers as you need</li>
+              <li>Fair bundle-deal splits</li>
+              <li>Who-pays-whom payouts</li>
+              <li>Emailed report and spreadsheet</li>
+            </ul>
+            <a class="button" href="/signup">Get started</a>
+          </article>
+          <article class="card">
+            <h3>Charity drive</h3>
+            <p class="price">$30 <span>per drive</span></p>
+            <ul>
+              <li>Your own items and departments</li>
+              <li>A PIN for every volunteer</li>
+              <li>Daily, item and cashier totals</li>
+              <li>Emailed report and spreadsheet</li>
+            </ul>
+            <a class="button ghost" href="/signup">Get started</a>
+          </article>
+        </div>
+        <p class="fine">Set up a paid event for free, and pay when you're ready to start selling.</p>
+      </section>
+
+      <section class="wrap section">
+        <h2>Your data, then gone</h2>
+        <p>
+          We keep an event's sales only while it's running and for 6 months after it
+          closes. When it closes we email you a full report and spreadsheets to keep, and
+          after 6 months the event and every sale in it are permanently deleted. Free
+          sales are deleted at midnight. Card payments for events are handled by Stripe,
+          and we never see your card number.
+        </p>
+      </section>
+    </main>
+
+    <footer class="wrap footer">
+      <span>SplitTheSale</span>
+      <a href="/app">Log in</a>
+      <a href="/signup">Sign up</a>
+    </footer>
   </body>
 </html>
